@@ -70,6 +70,9 @@ buffer.")
   "Buffer local filter predicate for Lister lists.
 Do not set this directly; use `lister-set-filter' instead.")
 
+(defvar-local lister-local-marking-predicate nil
+  "Buffer local marking predicate.
+Do not set this directly; use `lister-set-marking-predicate' instead.")
 ;;; * Data Types
 
 (cl-defstruct (lister--item (:constructor lister--item-create))
@@ -91,9 +94,9 @@ The slot DATA contains the 'real' data, which is printed using
   (setf (lister--item-level item) level)
   item)
 
-(defun lister--new-item-from-data (data &optional level markable)
-  "Create a new lister item storing DATA and LEVEL and MARKABLE."
-  (lister--item-create :data data :level level :markable markable))
+(defun lister--new-item-from-data (data &optional level)
+  "Create a new lister item storing DATA and LEVEL."
+  (lister--item-create :data data :level level))
 
 (defun lister--cleaned-item (item)
   "Return ITEM cleaned of position and visibility information.
@@ -712,6 +715,19 @@ first or the last node, respectively."
     (apply #'ewoc-invalidate ewoc nodes)))
 
 ;; * Marking
+(defun lister-set-marking-predicate (ewoc pred)
+  "Set PRED as a marking predicate in EWOC.
+All items whose data matches PRED are markable. If the
+PRED set to t, all items are markable."
+  (with-current-buffer (ewoc-buffer ewoc)
+    (setq-local lister-local-marking-predicate pred)
+    (lister-dolist-nodes (ewoc node :first :last)
+    (when-let* ((item     (ewoc-data node))
+                (data (lister--item-data item))
+                (pred (not (funcall lister-local-marking-predicate data))))
+        (with-current-buffer (ewoc-buffer ewoc)
+            (setf (lister--item-marked item) 'nil)
+            (lister--update-mark-state item))))))
 
 (defun lister-count-marked-items (ewoc &optional beg end)
   "Count all marked items in EWOC.
@@ -738,11 +754,15 @@ Use BEG and END to restrict the items checked."
   "In EWOC, mark or unmark node at POS using boolean STATE."
   (when-let ((node (lister--parse-position ewoc pos)))
     (let* ((item      (ewoc-data node))
+           (data      (lister--item-data item))
            (old-state (lister--item-marked item)))
-      (setf (lister--item-marked item) state)
       (when (not (eq old-state state))
         (with-current-buffer (ewoc-buffer ewoc)
-          (lister--update-mark-state item))))))
+          (let ((markable (funcall lister-local-marking-predicate data)))
+            ;; Can unmark after modifying `lister-local-marking-predicate'
+            (when (or markable old-state))
+            (setf (lister--item-marked item) state)
+            (lister--update-mark-state item)))))))
 
 (defun lister-mark-unmark-list (ewoc beg end state)
   "In EWOC, mark or unmark the list between BEG and END.
@@ -1283,6 +1303,18 @@ as elements) and must not undo the wrapping."
            (wrapped-list (lister--wrap-list l))
            (new-list     (lister--reorder-wrapped-list wrapped-list fn)))
       (lister--replace-items ewoc new-list beg end level))))
+
+(defun lister-reorder-this-level (ewoc pos fn)
+  (pcase-let ((`(,beg ,end) (lister--locate-sublist ewoc pos)))
+    (lister--reorder ewoc fn beg end)))
+
+(defalias 'lister-reorder-sublist-at  'lister-reorder-this-level)
+
+(defun lister-reorder-sublist-below (ewoc pos fn)
+  (let ((node (lister--parse-position ewoc pos)))
+    (when (lister-sublist-below-p ewoc node)
+      (pcase-let ((`(,beg ,end) (lister--locate-sublist ewoc (ewoc-next ewoc node))))
+    (lister--reorder ewoc fn beg end)))))
 
 (defun lister-reverse-list (ewoc &optional beg end)
   "Reverse the list in EWOC, preserving sublist associatios.

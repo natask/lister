@@ -91,9 +91,9 @@ The slot DATA contains the 'real' data, which is printed using
   (setf (lister--item-level item) level)
   item)
 
-(defun lister--new-item-from-data (data &optional level)
-  "Create a new lister item storing DATA and LEVEL."
-  (lister--item-create :data data :level level))
+(defun lister--new-item-from-data (data &optional level markable)
+  "Create a new lister item storing DATA and LEVEL and MARKABLE."
+  (lister--item-create :data data :level level :markable markable))
 
 (defun lister--cleaned-item (item)
   "Return ITEM cleaned of position and visibility information.

@@ -3,7 +3,7 @@
 ;; Copyright (C) 2018-2021
 
 ;; Author:  <joerg@joergvolbers.de>
-;; Version: 0.9.1
+;; Version: 0.9.4
 ;; Package-Requires: ((emacs "26.1"))
 ;; Keywords: lisp
 ;; URL: https://github.com/publicimageltd/lister
@@ -24,9 +24,6 @@
 ;;; Commentary:
 
 ;; A library for creating interactive list buffers.
-
-;;; TODO When marking, allow hook to additionally check if item at
-;;; point is markable (~ to "marking predicate")
 
 ;;; Code:
 
@@ -117,6 +114,48 @@ This is a simple copy of dash's `-flatten' using `seq'."
       (seq-mapcat #'lister--flatten l)
     (list l)))
 
+(defmacro lister-with-node (ewoc pos var &rest body)
+  "Bind VAR to the node at POS and execute BODY if node exists.
+EWOC is an ewoc structure."
+  (declare (indent 3) (debug (sexp sexp symbolp body)))
+  `(when-let ((,var (lister--parse-position ,ewoc ,pos)))
+     ,@body))
+
+(defmacro lister-with-node-or-error (ewoc pos var error &rest body)
+  "Bind VAR to the node at POS and execute BODY if node exists.
+Else, execute ERROR.  EWOC is an ewoc structure."
+  (declare (indent 3))
+  `(let ((,var (lister--parse-position ,ewoc ,pos)))
+     (if (not ,var)
+         ,error
+       ,@body)))
+
+(defmacro lister-save-current-node (ewoc &rest body)
+  "In EWOC, save point, execute BODY and restore point.
+Keep track of the position using the node's data object.  It is
+safe to delete and reinsert the node in BODY.  Do not restore
+point if the node's data object is invalid or not re-inserted
+after BODY exits."
+  (declare (indent 2) (debug (sexp body)))
+  (let ((pos-var     (make-symbol "--pos--"))
+        (item-var    (make-symbol "--item--"))
+        (footerp-var (make-symbol "--footer-p--"))
+        (eobp-var    (make-symbol "--eobp--")))
+    `(let* ((,footerp-var  (lister-eolp))
+            (,eobp-var     (eobp))
+            (,item-var     (unless ,footerp-var
+                             (ewoc-data (lister--parse-position ,ewoc :point)))))
+       ,@body
+       (if ,footerp-var
+           (if ,eobp-var
+               (goto-char (point-max))
+             (ewoc-goto-node ,ewoc (ewoc--footer ,ewoc)))
+         ;; this works because our custom ewoc printer always keeps the item
+         ;; slots "beg" and "end" up to date:
+         (when-let ((,pos-var (and ,item-var (lister--item-beg ,item-var))))
+           (with-current-buffer (marker-buffer ,pos-var)
+             (goto-char ,pos-var)))))))
+
 ;;; * Low-level printing / insertion:
 ;;;
 
@@ -149,21 +188,21 @@ times the string S.  If LEVEL is nil, use 0 instead."
 ;;; TODO Write tests
 (defun lister--make-string-intangible (string)
   "Make STRING intangible except where it has certain properties.
-Do not make the STRING intangible where the properties `field' or
-`button' are non-nil."
-  (let ((s (propertize string 'cursor-intangible t)))
-    (cl-dolist (prop '(field button))
-      (pcase-dolist (`(,from ,to) (lister--get-prop string prop))
-        (add-text-properties
-         ;; The first field character is not tangible, even though
-         ;; `describe-text-properties' says it has `cursor-intangible'
-         ;; set to nil. So we correct that. I don't understand why this
-         ;; works, however.  Something with stickiness, I think.
-         (max 0 (1- from))
-         to
-         '(cursor-intangible nil) ;; maybe add a special field face?
-         s)))
-    s))
+Do not make those parts of STRING intangible where the properties
+`field' or `button' are non-nil."
+  (add-text-properties 0 (length string) '(cursor-intangible t) string)
+  (cl-dolist (prop '(field button))
+    (pcase-dolist (`(,from ,to) (lister--get-prop string prop))
+      (add-text-properties
+       ;; The first field character is not tangible, even though
+       ;; `describe-text-properties' says it has `cursor-intangible'
+       ;; set to nil. So we correct that. I don't understand why this
+       ;; works, however.  Something with stickiness, I think.
+       (max 0 (1- from))
+       to
+       '(cursor-intangible nil) ;; maybe add a special field face?
+       string)))
+  string)
 
 (defun lister--insert-intangible (strings padding-level)
   "In current buffer, insert all STRINGS with text property 'intangible'.
@@ -180,6 +219,12 @@ strings according to PADDING-LEVEL and the buffer local value of
       (insert (lister--make-string-intangible
                (string-join strings "\n"))
               "\n")))) ;; <- this leaves the "tangible" gap for the next item!
+
+;; Insert header / footer
+
+;; The ewoc pretty printer does not know if it prints a header or a
+;; footer, but we need to handle them differently for setting text
+;; properties. So we wrap our own functions around.
 
 ;;; TODO Write tests
 (defun lister--get-hf-strings (hf-data)
@@ -199,40 +244,45 @@ function, nor a string, nor a list, nor nil, throw an error."
 (defun lister--insert-as-hf (hf-data)
   "In current Lister buffer, insert HF-DATA as header or footer.
 HF-DATA can be either a function, a string or a list of strings."
-  (when hf-data
-    (let* ((strings (lister--get-hf-strings hf-data))
-           (beg (point))
-           (lister-local-left-margin 0))
-      ;; Special treatment for footer only:
-      (when (and strings
-                 ;; `ewoc--refresh-node' calculates point using the start
-                 ;; marker of the node to be refreshed, so that should be
-                 ;; safe:
-                 (= beg (ewoc-location (ewoc--footer lister-local-ewoc))))
-        (setq strings (mapcar (lambda (s)
-                                (propertize s 'footer t))
-                              strings)))
-      (lister--insert-intangible strings 0)
-      (unless (get-text-property beg 'footer)
-        (put-text-property beg (1+ beg) 'front-sticky t)))))
+  (pcase-let ((`(,type ,data) hf-data))
+    (when data
+      (let* ((strings (lister--get-hf-strings data))
+             (beg     (point))
+             (lister-local-left-margin 0))
+        ;; Propertize footer for eolp recognition:
+        (when (and strings (eq type 'footer))
+          (setq strings (mapcar (lambda (s) (propertize s 'footer t)) strings)))
+        ;; insert...
+        (lister--insert-intangible strings 0)
+        ;; ..and close cursor gap in the header:
+        (when (eq type 'header)
+          (put-text-property beg (1+ beg) 'front-sticky t))))))
+
+(defun lister--get-hf (ewoc)
+  "Get header and footer of EWOC."
+  (pcase-let ((`(,header . ,footer) (ewoc-get-hf ewoc)))
+    ;; ewoc-create initializes with "" if header arg is nil
+    (list (if (eq header "") (list 'header "") header)
+          (if (eq footer "") (list 'footer "") footer))))
 
 (defun lister-refresh-header-footer (ewoc)
   "Redisplay the header and the footer of EWOC.
 Mostly makes sense if one them has a function as its data."
-  (let ((hf (ewoc-get-hf ewoc)))
-    (ewoc-set-hf ewoc (car hf) (cdr hf))))
+  (apply #'ewoc-set-hf ewoc (lister--get-hf ewoc)))
 
 (defun lister-set-header (ewoc strings-or-fn)
   "Set STRINGS-OR-FN as a list header in EWOC.
 Use STRINGS-OR-FN to determine the header.  It can be a function,
 a string or a list of strings."
-  (ewoc-set-hf ewoc strings-or-fn (cdr (ewoc-get-hf ewoc))))
+  (pcase-let ((`(_ ,footer) (lister--get-hf ewoc)))
+    (ewoc-set-hf ewoc (list 'header strings-or-fn) footer)))
 
 (defun lister-set-footer (ewoc strings-or-fn)
   "Set STRINGS-OR-FN as a list footer in EWOC.
 Use STRINGS-OR-FN to determine the footer.  It can be a function,
 a string or a list of strings."
-  (ewoc-set-hf ewoc (car (ewoc-get-hf ewoc)) strings-or-fn))
+  (pcase-let ((`(,header _) (lister--get-hf ewoc)))
+    (ewoc-set-hf ewoc header (list 'footer strings-or-fn))))
 
 ;; Make the item invisible / visible:
 
@@ -306,9 +356,12 @@ This is a slightly modified copy of `font-lock--remove-face-from-text-property'.
 ;; problem?
 (defun lister--ewoc-printer (item)
   "Insert pretty printed ITEM in the current buffer.
-ITEM is a `lister--item'.  Build the item by passing it to the
-buffer local mapper function, which must return a string or a
-list of strings."
+ITEM is a `lister--item', that is, the data hold in the local
+Ewoc's node.  Note that the `lister--item' is thus not just the
+data to be printed, but rather a structure with additional
+information which also holds the actual data.  Build the item by
+passing this data object to the buffer local mapper function,
+which must return a string or a list of strings."
   (unless lister-local-mapper
     (error "No buffer local mapper function defined"))
   (let* ((inhibit-read-only t)
@@ -318,9 +371,15 @@ list of strings."
          ;; flatten it and remove nil values:
          (strings   (lister--flatten strings))
          (beg       (point-marker)))
+    ;; FIXME If insertion happens before (!) on invisible overlay,
+    ;; e.g. if refreshing the top node of a hidden sublist, the
+    ;; ellipsis is not added at the end of this item, but rather
+    ;; displayed on a separate line. Could not find a simple fix for
+    ;; this.
+
+    ;; actual printing: insert the strings at point
     (lister--insert-intangible strings (lister--item-level item))
     ;; store positions for post-insertion modifications
-    ;; FIXME necessary?
     (set-marker-insertion-type beg t)
     (setf (lister--item-beg item) beg
           (lister--item-end item) (point-marker))
@@ -364,10 +423,12 @@ above, throw an error."
       (_        (error "Unkown position argument: %s" pos)))))
 
 ;; TODO Write tests
-(defun lister-eolp ()
-  "Return non-nil if point is after the last item of EWOC."
-  (or (eobp)
-      (get-text-property (point) 'footer)))
+(defun lister-eolp (&optional buf)
+  "Return non-nil if point is after the last item in BUF.
+Use the current buffer or BUF."
+  (with-current-buffer (or buf (current-buffer))
+    (or (eobp)
+        (get-text-property (point) 'footer))))
 
 (defun lister--determine-level (prev-level new-level)
   "Return the level for new items relative to PREV-LEVEL.
@@ -389,23 +450,52 @@ PREV-LEVEL."
 ;;; * Low level list movement basics
 
 (cl-defun lister--next-node-matching (ewoc node pred-fn
-                                        &optional (move-fn #'ewoc-next))
-  "In EWOC, move from NODE to next node matching PRED-FN via MOVE-FN.
-Return the next matching node or nil if there is none.  To move
-backwards, set MOVE-FN to `ewoc-prev'."
+                                           &optional
+                                           (move-fn #'ewoc-next)
+                                           limit)
+  "Starting from NODE, find the next node matching PRED-FN via MOVE-FN.
+Return the next matching node or nil if there is none.
+Optionally stop search unconditionally when reaching the node
+LIMIT, returning nil.  To move backwards, set MOVE-FN to
+`ewoc-prev'.  EWOC is an Ewoc object."
   (while (and node
               (setq node (funcall move-fn ewoc node))
+              (or (not (eq limit node))
+                  (setq node nil))
               (not (funcall pred-fn node))))
   node)
 
 (cl-defun lister--next-or-this-node-matching (ewoc node pred-fn
-                                                &optional (move-fn #'ewoc-next))
+                                                   &optional (move-fn #'ewoc-next)
+                                                   limit)
   "In EWOC, check NODE against PRED-FN or find next match.
-Return the matching node found by iterating on MOVE-FN, or nil if
-there is none.  To move backwards, set MOVE-FN to `ewoc-prev'."
-  (if (funcall pred-fn node)
-      node
-    (lister--next-node-matching ewoc node pred-fn move-fn)))
+Return the matching node found by iterating MOVE-FN, or nil if
+there is none.  Optionally stop search unconditionally when
+reaching the node LIMIT, returning nil.  To move backwards, set
+MOVE-FN to `ewoc-prev'."
+  (while (and node
+              (or (not (eq node limit))
+                  (setq node nil))
+              (not (funcall pred-fn node)))
+    (setq node (funcall move-fn ewoc node)))
+  node)
+
+(defun lister--next-node-same-level (ewoc pos move-fn)
+  "Find next node with POS's level, skipping items with bigger indentation.
+In EWOC, use MOVE-FN to find the next node with the same level as
+POS, skipping nodes with bigger indentation.  Return nil if no
+next node is found."
+  (lister-with-node ewoc pos node
+    (let ((level   (lister-get-level-at ewoc node)))
+      ;; this is actually a copy of lister--next-node-matching
+      ;; but hey, it seems so awkward to define a lambda for that!
+      (while (and node
+                  (setq node (funcall move-fn ewoc node))
+                  (> (lister--item-level (ewoc-data node)) level)))
+      ;; now node is either nil or <= level
+      (and node
+           (and (= (lister--item-level (ewoc-data node)) level)
+                node)))))
 
 (cl-defun lister--next-visible-node (ewoc node &optional
                                        (move-fn #'ewoc-next))
@@ -426,17 +516,26 @@ If NODE is nil, return the first visible node of the EWOC."
                                    #'lister-node-visible-p))
 
 (defun lister--last-visible-node (ewoc &optional node)
-  "Find the last visible node in EWOC, beginning with NODE.
+  "Find the last visible node in EWOC, searching backwards from NODE.
 If NODE is nil, return the last visible node of the EWOC."
   (lister--next-or-this-node-matching ewoc (or node (ewoc-nth ewoc -1))
                                    #'lister-node-visible-p
                                    #'ewoc-prev))
 
 ;;; * Public API
+
 (defun lister-get-ewoc (buf)
   "Get ewoc object associated with BUF."
-  (with-current-buffer buf
-    lister-local-ewoc))
+  ;; see https://github.com/alphapapa/emacs-package-dev-handbook#accessing-buffer-local-variables
+  (buffer-local-value 'lister-local-ewoc buf))
+
+(defun lister-modified-p (ewoc)
+  "Return non-nil if items in EWOC have been modified."
+  (buffer-local-value 'lister-local-modified (ewoc-buffer ewoc)))
+
+(defun lister-set-modified-p (ewoc &optional flag)
+  "Mark EWOC as modified according to FLAG."
+  (setf (buffer-local-value 'lister-local-modified (ewoc-buffer ewoc)) flag))
 
 (defmacro lister-with-boundaries (ewoc beg-var end-var &rest body)
   "In EWOC, do BODY binding BEG-VAR and END-VAR to list nodes.
@@ -482,7 +581,7 @@ immediately, use (cl-return).
                               body)))
   (let ((temp-node (make-symbol "--temp-node--"))
         (last-var  (make-symbol "--last-node--")))
-    `(let ((,var       (lister--parse-position ,ewoc (or ,beg :first)))
+    `(let ((,var      (lister--parse-position ,ewoc (or ,beg :first)))
            (,last-var (lister--parse-position ,ewoc (or ,end :last))))
        (cl-block nil
          (while ,var
@@ -566,8 +665,10 @@ set, restrict action only to matching nodes."
       (when (and (or (not pred-fn)
                      (funcall pred-fn data))
                  (setq new-data (funcall action-fn (cl-copy-seq data))))
-        (setf (lister--item-data (ewoc-data node)) new-data)
-        (ewoc-invalidate ewoc node)))))
+        (lister-replace-at ewoc node new-data)))))
+
+        ;; (setf (lister--item-data (ewoc-data node)) new-data)
+        ;; (ewoc-invalidate ewoc node)))))
 
 ;;; TODO Add return value counter for all calls to ACTION-FN
 ;;; TODO Document counter in lister-walk-marked-nodes
@@ -606,11 +707,9 @@ symbols `:first', `:last', `:point' (sic!), `:next' or `:prev'.
 
 Do nothing if position does not exist; throw an error if position
 is invalid (i.e. index is out of bounds) or invisible."
-  ;; NOTE This is a common pattern: when-let node, do something with
-  ;; node, else error. Refactor?
-  (when-let ((node (lister--parse-position ewoc pos)))
+  (lister-with-node ewoc pos node
     (if (lister--item-visible (ewoc-data node))
-        (ewoc-goto-node ewoc node)
+          (ewoc-goto-node ewoc node)
       (error "Cannot go to invisible item %s" pos))))
 
 ;; * Inspect Nodes
@@ -629,13 +728,13 @@ is invalid (i.e. index is out of bounds) or invisible."
 (defun lister-get-level-at (ewoc pos)
   "In EWOC, get the indentation level of the item at POS.
 Do nothing if POS is nil."
-  (when-let ((node (lister--parse-position ewoc pos)))
+  (lister-with-node ewoc pos node
     (lister-node-get-level node)))
 
 (defun lister-set-level-at (ewoc pos level)
   "In EWOC, set indentation of node at POS to LEVEL, refreshing it.
 Do nothing if POS is nil."
-  (when-let ((node (lister--parse-position ewoc pos)))
+  (lister-with-node ewoc pos node
     (lister-set-node-level ewoc node level)))
 
 (defun lister-node-get-data (node)
@@ -646,15 +745,15 @@ Do nothing if POS is nil."
   "In EWOC, return the data of the lister node at POS.
 POS can be either an ewoc node, an index position, or one of the
 symbols `:first', `:last', `:point', `:next' or `:prev'."
-  (if-let ((node (lister--parse-position ewoc pos)))
-      (lister-node-get-data node)
-    (error "No node or lister item at position %s" pos)))
+  (lister-with-node-or-error ewoc pos node
+    (error "No node or lister item at position %s" pos)
+    (lister-node-get-data node)))
 
 (defun lister-set-data-at (ewoc pos data)
   "In EWOC, replace the data at POS with DATA."
-  (let ((node (lister--parse-position ewoc pos)))
-    (unless node
-      (error "No node or lister item at position %s" pos))
+  (lister-with-node-or-error ewoc pos node
+    (error "No node or lister item at position %s" pos)
+    (lister-set-modified-p ewoc t)
     (setf (lister--item-data (ewoc-data node)) data)
     (ewoc-invalidate ewoc node)))
 
@@ -682,11 +781,12 @@ symbols `:first', `:last', `:point', `:next' or `:prev'."
 
 (defun lister-delete-at (ewoc pos)
   "In EWOC, delete node specified by POS."
+  (lister-set-modified-p ewoc t)
   (let* ((node (lister--parse-position ewoc pos))
          (inhibit-read-only t)
          (item  (ewoc-data node)))
     ;; deleting the marker saves memory and makes sure that
-    ;; `lister--finally-moving-to' works well
+    ;; `lister-save-current-node' works well
     (setf (lister--item-beg item) nil
           (lister--item-end item) nil)
     (ewoc-delete ewoc node)))
@@ -704,9 +804,9 @@ first or the last node, respectively."
 
 ;; * Redisplay items
 
-(defun lister-refresh-at (ewoc pos)
-  "In EWOC, redisplay the node at POS."
-  (when-let ((node (lister--parse-position ewoc pos)))
+(defun lister-refresh-at (ewoc pos-or-node)
+  "In EWOC, redisplay the node at POS-OR-NODE."
+  (lister-with-node ewoc pos-or-node node
     (ewoc-invalidate ewoc node)))
 
 (defun lister-refresh-list (ewoc &optional beg end)
@@ -729,6 +829,27 @@ PRED set to t, all items are markable."
             (setf (lister--item-marked item) 'nil)
             (lister--update-mark-state item))))))
 
+(defun lister--markable-p (ewoc node)
+  "Check if NODE is markable in EWOC.
+Return t if either there is no markable predicate set or if the
+predicate returns t when called with the node's data."
+  (with-current-buffer (ewoc-buffer ewoc)
+    (or (not lister-local-marking-predicate)
+        (funcall lister-local-marking-predicate (lister-node-get-data node)))))
+
+(defun lister-set-marking-predicate (ewoc pred)
+  "Set PRED as a marking predicate in EWOC.
+All items whose data matches PRED are markable.  Delete existing
+marks if they do not match PRED.  If the PRED set to nil, all
+items are markable."
+  (with-current-buffer (ewoc-buffer ewoc)
+    (setq-local lister-local-marking-predicate pred)
+    (when pred
+      (lister-walk-marked-nodes ewoc
+                                (lambda (ewoc node)
+                                  (lister-mark-unmark-at ewoc node
+                                                         (lister--markable-p ewoc node)))))))
+
 (defun lister-count-marked-items (ewoc &optional beg end)
   "Count all marked items in EWOC.
 Use BEG and END to restrict the items checked."
@@ -740,7 +861,7 @@ Use BEG and END to restrict the items checked."
 
 (defun lister-marked-at-p (ewoc pos)
   "Check if EWOC item at POS is marked."
-  (when-let ((node (lister--parse-position ewoc pos)))
+  (lister-with-node ewoc pos node
     (lister-node-marked-p node)))
 
 (defun lister-items-marked-p (ewoc &optional beg end)
@@ -752,15 +873,15 @@ Use BEG and END to restrict the items checked."
 
 (defun lister-mark-unmark-at (ewoc pos state)
   "In EWOC, mark or unmark node at POS using boolean STATE."
-  (when-let ((node (lister--parse-position ewoc pos)))
+  (lister-with-node ewoc pos node
     (let* ((item      (ewoc-data node))
            (data      (lister--item-data item))
            (old-state (lister--item-marked item)))
       (when (not (eq old-state state))
         (with-current-buffer (ewoc-buffer ewoc)
-          (let ((markable (funcall lister-local-marking-predicate data)))
-            ;; Can unmark after modifying `lister-local-marking-predicate'
-            (when (or markable old-state))
+          ;; Can unmark after modifying `lister-local-marking-predicate'
+          (when (or (lister--markable-p ewoc node)
+                    old-state)
             (setf (lister--item-marked item) state)
             (lister--update-mark-state item)))))))
 
@@ -826,6 +947,7 @@ visible.  Alternative predicates can be passed to MARKER-PRED-FN."
   (let* ((inhibit-read-only t)
          (pred-fn (or marker-pred-fn #'lister-node-marked-and-visible-p))
          (nodes   (lister-collect-nodes ewoc beg end pred-fn)))
+    (lister-set-modified-p ewoc t)
     (apply #'ewoc-delete ewoc nodes)))
 
 ;; * Insert Items
@@ -866,6 +988,7 @@ Items inserted at top always have level 0.  Create each inserted
 item by calling ITEM-FN with two arguments, the current element
 of the list and its assigned level.  Insert L before (or
 visually 'above') the node at POS, unless INSERT-AFTER is set."
+  (lister-set-modified-p ewoc t)
   (let* (;; determine the level:
          (node (lister--parse-position ewoc pos))
          (prev (if insert-after node (ewoc-prev ewoc node)))
@@ -982,51 +1105,88 @@ list '(A (B C))'."
   (lister-delete-all ewoc)
   (lister---walk-insert ewoc l 0 nil #'lister--new-item-from-data))
 
-;; * Functions to find nodes (next, prev)
+;; * Higher Level Functions to Find Nodes
 
-(cl-defun lister-next-matching (ewoc pos pred)
-  "In EWOC, find next match for PRED starting from POS.
+;; These functions basically wrap their corresponding 'private'
+;; equivalent so that positions instead of node objects can be passed
+;; as arguments.  Also these functions apply PRED-FN to the data and
+;; not the nodes.
+
+;; TODO Add tests for using positions for LIMIT
+(defun lister-next-matching (ewoc pos pred &optional limit)
+  "In EWOC, find next match for PRED after POS.
 PRED is checked against the node's data.  Begin searching from
 POS, which is a position understood by `lister--parse-position'.
-Return the node found or nil."
-  (let ((node (lister--parse-position ewoc pos)))
+Optionally unconditoinally stop searching when reaching the
+position LIMIT, returning nil.  Return the node found or nil."
+  (lister-with-node ewoc pos node
     (lister--next-node-matching ewoc node
                                 (lambda (n)
-                                  (funcall pred (lister--item-data (ewoc-data n)))))))
+                                  (funcall pred (lister-node-get-data n)))
+                                #'ewoc-next
+                                (and limit (lister--parse-position ewoc limit)))))
 
-(defun lister-next-visible-matching (ewoc pos pred)
-  "In EWOC, moving from POS, find the next visible match for PRED.
+;; TODO Add tests for using positions for LIMIT
+(defun lister-first-matching (ewoc pos pred &optional limit)
+  "In EWOC, find first match for PRED starting from (and including) POS.
+PRED is checked against the node's data.  Begin searching at POS,
+which is a position understood by `lister--parse-position'.
+Optionally unconditionally stop searching when reaching the
+position LIMIT, returning nil.  Return the node found or nil."
+  (lister-with-node ewoc pos node
+    (lister--next-or-this-node-matching ewoc node
+                                        (lambda (n)
+                                          (funcall pred (lister-node-get-data n)))
+                                        #'ewoc-next
+                                        (and limit (lister--parse-position ewoc limit)))))
+
+;; NOTE Do we need the following function? It Seems to be useless
+;; insofar it checks against item's data and ignores level. So what is
+;; the point in checking a node only against visibility, and ignoring
+;; that it might have another level? Better add a nesting predicate or
+;; something....
+
+;; TODO Add tests for using positions for LIMIT
+(defun lister-next-visible-matching (ewoc pos pred &optional limit)
+  "In EWOC, find the next visible match for PRED after POS.
 PRED is checked against the node's data.  Begin searching from
 POS, which is a position understood by `lister--parse-position'.
-Return the node found or nil."
-  (let ((node (lister--parse-position ewoc pos)))
-    (lister--next-node-matching ewoc node
-                                (lambda (n)
-                                  (and (lister-node-visible-p n)
-                                       (funcall pred (lister--item-data (ewoc-data n))))))))
-
-(cl-defun lister-prev-matching (ewoc pos pred)
-  "Moving from POS via MOVE-FN, find the prev node in EWOC matching PRED.
-PRED is checked against the node's data.  Begin searching
-backwards from POS, which is a position understood by
-`lister--parse-position'.  Return the node found or nil."
-  (let ((node (lister--parse-position ewoc pos)))
-    (lister--next-node-matching ewoc node
-                                (lambda (n)
-                                  (funcall pred (lister--item-data (ewoc-data n))))
-                                #'ewoc-prev)))
-
-(defun lister-prev-visible-matching (ewoc pos pred)
-  "Moving from POS, find the prev visible node in EWOC matching PRED.
-PRED is checked against the node's data.  Begin searching
-backwards from POS, which is a position understood by
-`lister--parse-position'.  Return the node found or nil."
+Optionally unconditionally stop searching when reaching the
+position LIMIT, returning nil.  Return the node found or nil."
   (let ((node (lister--parse-position ewoc pos)))
     (lister--next-node-matching ewoc node
                                 (lambda (n)
                                   (and (lister-node-visible-p n)
                                        (funcall pred (lister--item-data (ewoc-data n)))))
-                                #'ewoc-prev)))
+                                #'ewoc-next
+                                (and limit (lister--parse-position ewoc limit)))))
+
+;; TODO Add tests for using positions for LIMIT
+(cl-defun lister-prev-matching (ewoc pos pred &optional limit)
+  "Find the prev node in EWOC matching PRED before POS.
+PRED is checked against the node's data.  Begin searching
+backwards from POS, which is a position understood by
+`lister--parse-position'.  Return the node found or nil."
+  (lister-with-node ewoc pos node
+    (lister--next-node-matching ewoc node
+                                (lambda (n)
+                                  (funcall pred (lister-node-get-data n)))
+                                #'ewoc-prev
+                                (and limit (lister--parse-position ewoc limit)))))
+
+;; TODO Add tests for using positions for LIMIT
+(defun lister-prev-visible-matching (ewoc pos pred &optional limit)
+  "Find the prev visible node in EWOC matching PRED before POS.
+PRED is checked against the node's data.  Begin searching
+backwards from POS, which is a position understood by
+`lister--parse-position'.  Return the node found or nil."
+  (lister-with-node ewoc pos node
+    (lister--next-node-matching ewoc node
+                                (lambda (n)
+                                  (and (lister-node-visible-p n)
+                                       (funcall pred (lister-node-get-data n))))
+                                #'ewoc-prev
+                                (and limit (lister--parse-position ewoc limit)))))
 
 ;; * Getting items
 
@@ -1083,6 +1243,25 @@ matching PRED-FN."
                       (or pred-fn #'identity)
                       #'lister--cleaned-item))
 
+(defun lister-map (ewoc fn &optional pred-fn beg end start-level)
+  "Apply FN to the data tree in EWOC.
+BEG and END can be any position understood by
+`lister--parse-position'.  If they are nil, traverse the whole
+list.  Restrict the result to items matching PRED-FN.  Use
+START-LEVEL as the level of the first node; higher node levels
+will result in nested lists."
+  (let ((pred-fn (or pred-fn #'identity)))
+    (cl-labels ((predicate-fn (node)
+                              (funcall pred-fn
+                                       (lister--item-data (ewoc-data node))))
+                (key-fn       (data)
+                              (funcall fn (lister--item-data data))))
+      ;;
+      (lister--get-nested ewoc beg end
+                          (or start-level 0)
+                          #'predicate-fn
+                          #'key-fn))))
+
 (defun lister-get-list (ewoc &optional beg end start-level pred-fn)
   "Return the data of EWOC as a list, preserving hierarchy.
 Collect the data slots of all items between BEG and END.  BEG and
@@ -1108,44 +1287,67 @@ set an initial indentation level for the first item."
 
 ;;; * Sublist handling
 
-;; All sublist handling applies to the complete, unfiltered EWOC.
+(defun lister--locate-sublist (ewoc pos &optional only-visible)
+  "Return first and last node in EWOC with the same level as POS.
+Return the nodes as a list `(first last)' or nil if the EWOC is
+empty.
 
-(defun lister--locate-sublist (ewoc pos)
-  "Return first and last node in EWOC with the same level as POS."
-  (when-let ((node (lister--parse-position ewoc pos)))
-    (let* ((item (ewoc-data node))
-           (ref-level (or (lister--item-level item) 0))
-           (pred-fn   (lambda (n)
-                        (< (or (lister--item-level (ewoc-data n)) 0)
-                           ref-level)))
+If ONLY-VISIBLE is non-nil, return the first and last visible
+inner sublist node.  If the sublist has no visible items, return
+the boundaries of the complete list.  If the list is completely
+hidden, return nil.
+
+This function implicitly defines a 'sublist' as a continuous list
+of items with a nesting level identical to, or bigger than, the
+item at POS.  A sublist must have a 'top' parent node with lesser
+indentation, while it is optional to have a 'bottom' node.  If
+there is no 'bottom' node, the last item marks the end of that
+sublist.  If there is no parent node, effectively return the
+boundaries of the complete list."
+  (lister-with-node ewoc pos node
+    (let* ((ref-level      (lister-node-get-level node))
+           (pred-fn        (lambda (n)
+                             (< (lister-node-get-level n)
+                                ref-level)))
+           (inner-pred-fn  (if only-visible
+                               #'lister-node-visible-p
+                             #'identity))
            ;; find upper and lower non-sublist boundaries:
            (upper (lister--next-node-matching ewoc node pred-fn #'ewoc-prev))
            (lower (lister--next-node-matching ewoc node pred-fn #'ewoc-next))
-           ;; we want the first and last item of the sublist itself:
-           (upper (when upper (ewoc-next ewoc upper)))
-           (lower (when lower (ewoc-prev ewoc lower)))
-           ;; if there was nothing, it is the whole list:
-           (upper (or upper (ewoc-nth ewoc 0)))
-           (lower (or lower (ewoc-nth ewoc -1))))
-      `(,upper ,lower))))
+           ;; we want the first and last (visible) item of the sublist itself:
+           (inner-first (when upper (lister--next-node-matching ewoc upper inner-pred-fn #'ewoc-next lower)))
+           (inner-last  (when lower (lister--next-node-matching ewoc lower inner-pred-fn #'ewoc-prev upper)))
+           ;; re-adjust the results if no boundaries were found:
+           (inner-first (or inner-first (if only-visible
+                                             (lister--first-visible-node ewoc)
+                                           (ewoc-nth ewoc 0))))
+           (inner-last  (or inner-last  (if only-visible
+                                            (lister--last-visible-node ewoc)
+                                          (ewoc-nth ewoc -1)))))
+      ;; NOTE it would suffice to check for one boundary since it should
+      ;; never happen that only one is not found, but well...
+      (when (or inner-first inner-last)
+        `(,inner-first ,inner-last)))))
 
-(defmacro lister-with-sublist-at (ewoc pos beg end &rest body)
-  "Execute BODY with BEG and END bound to the sublist at POS.
+(defmacro lister-with-sublist-at (ewoc pos beg-var end-var &rest body)
+  "Execute BODY with BEG-VAR and END-VAR bound to the sublist at POS.
 If there is no sublist, do not execute BODY and return nil.
 
-POS can be any value understood by `lister--parse-position'.  BEG
-and END have to be symbol names; they are bound to the upper and
-lower limit of the sublist at POS.  EWOC is a lister ewoc object."
+POS can be any value understood by `lister--parse-position'.
+BEG-VAR and END-VAR have to be symbol names; they will be bound
+to the upper and lower limit of the sublist at POS.  EWOC is a
+lister ewoc object."
   (declare (indent 4) (debug (sexp sexp symbolp symbolp body)))
-  (unless (and (symbolp beg) (not (keywordp beg)))
-    (signal 'wrong-type-argument (list 'symbolp beg)))
-  (unless (and (symbolp end) (not (keywordp end)))
-    (signal 'wrong-type-argument (list 'symbolp end)))
+  (unless (and (symbolp beg-var) (not (keywordp beg-var)))
+    (signal 'wrong-type-argument (list 'symbolp beg-var)))
+  (unless (and (symbolp end-var) (not (keywordp end-var)))
+    (signal 'wrong-type-argument (list 'symbolp end-var)))
   (let ((boundaries-var (make-symbol "boundaries")))
     `(let* ((,boundaries-var (lister--locate-sublist ,ewoc ,pos))
-            (,beg       (car ,boundaries-var))
-            (,end       (cadr ,boundaries-var)))
-       (when (and ,beg ,end)
+            (,beg-var       (car ,boundaries-var))
+            (,end-var       (cadr ,boundaries-var)))
+       (when (and ,beg-var ,end-var)
          ,@body))))
 
 (defmacro lister-with-sublist-below (ewoc pos beg end &rest body)
@@ -1237,17 +1439,22 @@ If no list is found, return nil."
 ;;; * Sorting (or, more abstract, reordering)
 
 (defun lister--wrap-list (l)
-  "Wrap nested list L in a list, with sub-lists as its cdr."
+  "Wrap nested list L in a list, with sub-lists as its cdr.
+Each list element must be either a nested list or a non-list
+atom.  Throw an error if there is a sublist (a nested list)
+without a previous non-nested list item."
   (declare (pure t) (side-effect-free t))
-  (let (acc (walk l))
-    (while
-        (let ((current (car walk))
-              (next    (cadr walk)))
-          (unless (consp current)
-            (push (cons current (when (consp next)
-                                  (lister--wrap-list next)))
-                  acc))
-          (setq walk (cdr walk))))
+  (let (acc (tail l))
+    (while tail
+      (let ((item (car tail))
+            (next (cadr tail)))
+        (when (consp item)
+          (error "Cannot wrap sublists w/o top heading item"))
+        (push (cons item (when (consp next)
+                           (setq tail (cdr tail))
+                           (lister--wrap-list next)))
+              acc)
+        (setq tail (cdr tail))))
     (nreverse acc)))
 
 (defun lister--reorder-wrapped-list (wrapped-l fn)
@@ -1304,17 +1511,15 @@ as elements) and must not undo the wrapping."
            (new-list     (lister--reorder-wrapped-list wrapped-list fn)))
       (lister--replace-items ewoc new-list beg end level))))
 
-(defun lister-reorder-this-level (ewoc pos fn)
-  (pcase-let ((`(,beg ,end) (lister--locate-sublist ewoc pos)))
-    (lister--reorder ewoc fn beg end)))
+(defun lister-reorder-sublist-at (ewoc pos pred)
+  "Reorder the sublist at POS in EWOC by PRED."
+    (lister-with-sublist-at ewoc pos beg end
+    (lister--reorder ewoc pred beg end)))
 
-(defalias 'lister-reorder-sublist-at  'lister-reorder-this-level)
-
-(defun lister-reorder-sublist-below (ewoc pos fn)
-  (let ((node (lister--parse-position ewoc pos)))
-    (when (lister-sublist-below-p ewoc node)
-      (pcase-let ((`(,beg ,end) (lister--locate-sublist ewoc (ewoc-next ewoc node))))
-    (lister--reorder ewoc fn beg end)))))
+(defun lister-reorder-sublist-below (ewoc pos pred)
+  "Reorder the sublist below POS in EWOC by PRED."
+  (lister-with-sublist-at ewoc pos beg end
+    (lister--reorder ewoc pred beg end)))
 
 (defun lister-reverse-list (ewoc &optional beg end)
   "Reverse the list in EWOC, preserving sublist associatios.
@@ -1322,14 +1527,26 @@ Use BEG and END to specify the first and the last item of the
 list to be reversed."
   (lister--reorder ewoc #'reverse beg end))
 
-(defun lister-sort-list (ewoc pred &optional beg end)
-  "In EWOC, sort the list and sublists using PRED.
-Use BEG and END to specify the first and the last item of the
-list to be reversed."
+(defun lister--sort-reduce (comps l)
+  "Sort wrapped list L using all sort comparators COMPS.
+Apply COMPS in sequence, using the result of applying the first
+comperator as input for the second round, etc.  Even if L has to
+be a 'wrapped' list, COMPS have direct access to the item data."
   (cl-labels ((key-fn (item)
-                        (lister--item-data (car item))))
+                      (lister--item-data (car item)))
+              (copy-sort (l comp)
+                         (seq-sort-by #'key-fn comp (copy-sequence l))))
+    (seq-reduce #'copy-sort (reverse comps) l)))
+
+(defun lister-sort-list (ewoc comps &optional beg end)
+  "In EWOC, sort the list and sublists using COMPS.
+BEG and END specify the first and the last item of the list
+range.  PREDS is either a single comperator function (like
+`string>') or a list of comperators.  Apply all COMPS from first
+to last on the list."
+  (let ((comps (if (listp comps) comps (list comps))))
     (lister--reorder ewoc
-                     (apply-partially #'seq-sort-by #'key-fn pred)
+                     (apply-partially #'lister--sort-reduce comps)
                      beg end)))
 
 (defun lister-sort-sublist-at (ewoc pos pred)
@@ -1370,7 +1587,7 @@ PRED nil effectively removes any existing filter."
 (defun lister--outline-invisible-p (ewoc pos)
   "Non-nil if the item at POS is hidden as part of an outline.
 EWOC is a lister Ewoc object."
-  (when-let ((node (lister--parse-position ewoc pos)))
+  (lister-with-node ewoc pos node
     (let* ((pos (lister--item-beg (ewoc-data node))))
       (eq (get-char-property pos 'invisible) 'outline))))
 
@@ -1388,11 +1605,14 @@ If STATE is nil, show the items between BEG and END, else hide
 them as an outline."
   (lister-with-boundaries ewoc beg end
     (with-current-buffer (ewoc-buffer ewoc)
+      ;; we move the overlay one to the left, so that the first LF
+      ;; remains visible (it is the cursor gap) and the last LF is
+      ;; hidden (it is part of the last item to be made invisible)
       (let ((from (1- (lister--item-beg (ewoc-data beg))))
             (to   (1- (lister--item-end (ewoc-data end)))))
         (remove-overlays from to 'invisible 'outline)
         (when state
-          (let ((o (make-overlay from to)))
+          (let ((o (make-overlay from to nil t t)))
             (overlay-put o 'evaporate t)
             (overlay-put o 'invisible 'outline)
             ;; the value of the property 'isearch-open-invisible
@@ -1425,40 +1645,10 @@ EWOC is a lister Ewoc object."
 
 ;; Move sublists:
 
-(defmacro lister--finally-moving-to (ewoc pos &rest body)
-  "Execute BODY and then move to POS in EWOC.
-Keep track of the position of the node at POS by keeping a
-reference to its data object.  It is safe to delete and reinsert
-the node in BODY.  If the node's data object is invalid or not
-re-inserted after BODY exits, do nothing."
-  (declare (indent 2) (debug (sexp symbolp body)))
-  (let ((pos-var  (make-symbol "--pos--"))
-        (item-var (make-symbol "--item--")))
-    `(let ((,item-var (ewoc-data (lister--parse-position ,ewoc ,pos))))
-     ,@body
-     (when-let ((,pos-var (and ,item-var (lister--item-beg ,item-var))))
-       (with-current-buffer (marker-buffer ,pos-var)
-         (goto-char ,pos-var))))))
-
-(defun lister--next-node-same-level (ewoc pos move-fn)
-  "Move to next node, skipping items with bigger indentation.
-In EWOC, use MOVE-FN to find the next node with the same level as
-POS, skipping nodes with bigger indentation.  Return nil if no
-node is found."
-  (when-let* ((node    (lister--parse-position ewoc pos))
-              (level   (lister-get-level-at ewoc node)))
-    (while (and node
-                (setq node (funcall move-fn ewoc node))
-                (> (lister--item-level (ewoc-data node)) level)))
-    ;; now node is either nil or <= level
-    (and node
-         (and (= (lister--item-level (ewoc-data node)) level)
-              node))))
-
 (defun lister--move-list (ewoc beg end target insert-after)
   "Insert items from BEG to END at TARGET according to INSERT-AFTER.
 EWOC is a lister ewoc object.  Keep cursor at the node at point."
-  (lister--finally-moving-to ewoc :point
+  (lister-save-current-node ewoc
     (let* ((level (lister-get-level-at ewoc beg))
            (l (lister--get-items ewoc beg end level #'identity)))
       (lister-delete-list ewoc beg end)
@@ -1491,7 +1681,7 @@ EWOC is a lister ewoc object.  Keep cursor at the node at point."
     (if (and (eq beg (ewoc-nth ewoc 0))
              (eq end (ewoc-nth ewoc -1)))
         (error "No sublist at this position")
-      (lister--finally-moving-to ewoc :point
+      (lister-save-current-node ewoc
         (lister-dolist-nodes (ewoc node beg end)
           (cl-incf (lister--item-level (ewoc-data node)))
           (ewoc-invalidate ewoc node))))))
@@ -1501,7 +1691,7 @@ EWOC is a lister ewoc object.  Keep cursor at the node at point."
   (lister-with-sublist-at ewoc pos beg end
     (if (eq 0 (lister-node-get-level beg))
         (error "Sublist cannot be moved further left"))
-    (lister--finally-moving-to ewoc :point
+    (lister-save-current-node ewoc
       (lister-dolist-nodes (ewoc node beg end)
         (cl-decf (lister--item-level (ewoc-data node)))
         (ewoc-invalidate ewoc node)))))
@@ -1563,7 +1753,67 @@ unless IGNORE-LEVEL is non-nil."
     (unless (eq level 0)
       (lister-set-level-at ewoc pos (1- level)))))
 
-;;; * Set up buffer for printing:
+;;; * Find nodes within the hierarchy
+
+(defun lister-top-sublist-node (ewoc pos)
+  "Return the first visible node of the current sublist.
+Search within EWOC, beginning from the node at POS."
+  (pcase-let ((`(,upper ,_) (lister--locate-sublist ewoc pos :only-visible)))
+    upper))
+
+(defun lister-bottom-sublist-node (ewoc pos)
+  "Return the last visible node of the current sublist.
+Search within EWOC, beginning from the node at POS."
+  (pcase-let ((`(,_ ,lower) (lister--locate-sublist ewoc pos :only-visible)))
+    lower))
+
+(defun lister-parent-node (ewoc pos)
+  "In EWOC, find the first visible parent node of POS.
+Return the node.  If POS is not in a sublist or if all parent
+nodes are hidden, return the first visible top node.  Return nil
+if POS if POS is already at the top, or if no final position can
+be found."
+  (lister-with-node ewoc pos node
+    (let* ((ref-level (lister-node-get-level node))
+           ;; if we ever have -compose, write that as a composition
+           (pred-fn   (lambda (n)
+                        (and (lister-node-visible-p n)
+                             (< (lister-node-get-level n)
+                                ref-level)))))
+      (or
+       ;; nil if pos is not in a visible sublist:
+       (lister--next-node-matching ewoc node pred-fn #'ewoc-prev)
+       ;; else find parent top node:
+       (lister--next-or-this-node-matching
+        ewoc (ewoc-nth ewoc 0)
+        ;; if we ever have -compose, write that as a composition
+        (lambda (n)
+          (and (lister-node-visible-p n)
+               (>= (lister-node-get-level n)
+                   ref-level)))
+        #'ewoc-next
+        node)))))
+
+(defun lister-first-sublist-node (ewoc pos direction)
+  "Looking from the list at POS, find the first sublist node.
+Return the node or nil if there is none.  DIRECTION must be
+either the symbol `up' or `prev', or `down' or `next'.  EWOC is a
+Lister EWOC object."
+  (lister-with-node ewoc pos node
+    (lister-with-sublist-at ewoc pos upper lower
+      (let* ((move-fn   (pcase direction
+                          ((or 'up 'prev) #'ewoc-prev)
+                          ((or 'down 'next) #'ewoc-next)
+                          (_ (error "Unknown direction %S" direction))))
+             (ref-level (lister-node-get-level (lister--parse-position ewoc pos)))
+             (pred-fn   (lambda (n)
+                          (and (lister-node-visible-p n)
+                               (> (lister-node-get-level n)
+                                  ref-level))))
+             (limit     (if (eq move-fn #'ewoc-prev) upper lower)))
+        (lister--next-node-matching ewoc node pred-fn move-fn limit)))))
+
+;;; * Set up buffer for display
 ;;;
 ;;;###autoload
 (defun lister-setup (buf-or-name mapper &optional header footer)
@@ -1585,6 +1835,8 @@ strings."
     ;; Prepare for outline
     (set (make-local-variable 'line-move-ignore-invisible) t)
     (add-to-invisibility-spec '(outline . t))
+    ;; Further settings:
+    (setq-local buffer-undo-list t)
     (read-only-mode +1)
     (cursor-intangible-mode +1)
     (setq-local lister-local-mapper mapper)

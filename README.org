@@ -4,9 +4,9 @@
 
 # NOTE: Do not forget to update the release in PROJECT STATUS and
 # CHANGELOG!
-This is the documentation for =Lister= version =0.9.1=
+This is the documentation for =Lister= version =0.9.4=
 
-*NOTE*: *This version is a complete rewrite* and it *breaks all code* which
+*NOTE*: *This version 0.9.x is a complete rewrite* and it *breaks all code* which
 had been using the previous version =0.7.2=. To retain the legacy code,
 use the archive branch =archive-version-0.7.2=. It should not be too
 difficult, however, to adapt the code.
@@ -41,6 +41,7 @@ or otherwise edit lists from various sources.
   - [[#bumps-and-wrinkles][Bumps and Wrinkles]]
 - [[#api][API]]
   - [[#setting-up-the-buffer][Setting up the buffer]]
+  - [[#the-mapper-function][The mapper function]]
   - [[#lister-mode-minor-mode][Lister Mode (minor mode)]]
   - [[#inserting-adding-deleting-or-replacing-single-items][Inserting, adding, deleting or replacing single items]]
   - [[#inserting-adding-deleting-or-replacing-lists-of-items][Inserting, adding, deleting or replacing lists of items]]
@@ -54,32 +55,39 @@ or otherwise edit lists from various sources.
   - [[#finding-nodes][Finding nodes]]
   - [[#looping][Looping]]
   - [[#interactive-editing][Interactive editing]]
+  - [[#modified-flag][Modified flag]]
   - [[#miscellaneous][Miscellaneous]]
 - [[#changelog][Changelog]]
-  - [[#current-version][Current version]]
+  - [[#current][Current]]
+  - [[#094][0.9.4]]
+  - [[#093][0.9.3.]]
+  - [[#092][0.9.2]]
   - [[#091][0.9.1]]
   - [[#09][0.9]]
 :END:
 
 * Project status
 
-Current release is =0.9.1=
+Current release is =0.9.4=
 
 * Feature overview
 
-This is an overview of features done or planned.
+This is an overview of features done or planned. A feature is
+considered =stable= if it is used and tested by the auther. If it is
+rarely used, but seems to work, it just =works=. 
 
-| Feature                              | State  | Automated tests? |
-|--------------------------------------+--------+------------------|
-| build simple or large lists          | stable | yes              |
-| build nested lists                   | stable | yes              |
-| retrieve data, with hierarchies      | stable | yes              |
-| loop over the list                   | stable | yes              |
-| marking or unmarking items           | stable | yes              |
-| filter items                         | stable | yes              |
-| hide and show sublists outline-style | stable | yes              |
-| move items and sublists              | works  | yes              |
-|--------------------------------------+--------+------------------|
+| Feature                              | State           | Automated tests? |
+|--------------------------------------+-----------------+------------------|
+| build simple or large lists          | stable          | yes              |
+| build nested lists                   | stable          | yes              |
+| retrieve data, with hierarchies      | stable          | yes              |
+| loop over the list                   | stable          | yes              |
+| marking or unmarking items           | stable          | yes              |
+| filter items                         | stable          | yes              |
+| hide and show sublists outline-style | partially buggy | not enough       |
+| move items and sublists              | works           | yes              |
+| navigate within the hierarchy        | works           | yes              |
+|--------------------------------------+-----------------+------------------|
 
 * Example
 
@@ -197,6 +205,38 @@ into a printable representation with a /mapper function/.
    thousand items. I would love to optimize it more for bigger lists
    once this becomes a real need.
  
+* Navigation and Marking with Lister Mode (minor mode)
+
+There is a minor mode shipped with the package which provides some
+basic keybindings. Here's the keymap:
+
+| Key                 | Function                                                              |
+|---------------------+-----------------------------------------------------------------------|
+| m                   | Mark item at point, or active region, or sublist if prefixed          |
+| u                   | Unmark item at point, or active region, or sublist if prefixed        |
+| U                   | Unmark all items in the buffer                                        |
+| M-up, M-down        | Move item at point one up, or down (prefix lifts level restriction)   |
+| M-left, M-right     | Indent or unindent the item at point (prefix lifts level restriction) |
+| S-M-up, S-M-down    | Move sublist at point one up, down                                    |
+| S-M-right, S-M-left | Indent or unindent sublist at point                                   |
+| <TAB>               | Cycle outline visibility of sublist below point                       |
+| C-c C-b / C-c C-f   | Move forward or backward to next node with same level                 |
+| C-c C-u             | Move to the next parent node                                          |
+| M-< / M->           | Move to the beginning or end of the current sublist or list.          |
+| C-c <C-up>          | Move up to the next child node                                        |
+| C-c <C-down>        | Move down to the next child node                                      |
+|---------------------+-----------------------------------------------------------------------|
+
+The commands to mark and unmark also recognize the region. So you can
+mark the whole list by pressing =C-x h m=. 
+
+All navigation commands push point on mark if they jump more than one
+step.
+
+If the keys =M-<= and =M->= are pressed repeatedly, move out of the
+sublist to the next outer level list and finally to the top or bottom
+item.
+
 * API
 ** Setting up the buffer
 
@@ -224,8 +264,11 @@ function =ewoc-get-hf=.
 
 =Lister-setup= returns an ewoc object, which is then used as the basic
 reference for all =Lister= operations. The ewoc object is also stored in
-the buffer local variable =lister-local-ewoc=. It can be used to access
-the ewoc in an interactive function, like this:
+the buffer local variable =lister-local-ewoc=, which can be retreived
+with =lister-get-ewoc=.
+
+The buffer local variable can be used to access the ewoc in an
+interactive function, like this:
 
 #+begin_src emacs-lisp
 (defun do-something (ewoc pos)
@@ -272,26 +315,6 @@ Example:
                                   'action 'my-action)))
     (switch-to-buffer (ewoc-buffer ewoc)))
 #+end_src
-
-** Lister Mode (minor mode)
-
-There is a minor mode shipped with the package which provides some
-basic keybindings. Here's the keymap:
-
-| Key                 | Function                                                              |
-|---------------------+-----------------------------------------------------------------------|
-| m                   | Mark item at point, or active region, or sublist if prefixed          |
-| u                   | Unmark item at point, or active region, or sublist if prefixed        |
-| U                   | Unmark all items in the buffer                                        |
-| M-up, M-down        | Move item at point one up, or down (prefix lifts level restriction)   |
-| M-left, M-right     | Indent or unindent the item at point (prefix lifts level restriction) |
-| S-M-up, S-M-down    | Move sublist at point one up, down                                    |
-| S-M-right, S-M-left | Indent or unindent sublist at point                                   |
-| <TAB>               | Cycle outline visibility of sublist below point                       |
-|---------------------+-----------------------------------------------------------------------|
-
-The commands to mark and unmark also recognize the region. So you can
-mark the whole list by pressing =C-x h m=. 
 
 ** Inserting, adding, deleting or replacing single items
 
@@ -374,6 +397,9 @@ sublist.
 ;; Get the sublist at or below POS:
 (lister-get-sublist-at ewoc pos)
 (lister-get-sublist-below ewoc pos)
+;; Map the data of a list (as a tree):
+;; Node that PRED-FN and FN applies to the item data
+(lister-map ewoc fn &optional pred-fn beg end start-level))
 #+end_src
 
 All functions (except =lister-get-data=, of course) return a list of
@@ -464,6 +490,8 @@ lister-mark-face-or-property
 (lister-count-marked-items ewoc &optional beg end)
 ;; Mark or unmark the item at POS:
 (lister-mark-unmark-at ewoc pos state)
+;; Set a limiting predicate:
+(lister-set-marking-predicate ewoc pred)
 ;; Mark or unmark a whole list:
 (lister-mark-unmark-list ewoc beg end state)
 (lister-mark-unmark-sublist-at ewoc pos state)
@@ -476,7 +504,10 @@ lister-mark-face-or-property
 #+end_src
 
 If =STATE= is nil, mark the item or the specified list items; else
-unmark them.
+unmark them. Optionally set a buffer-local marking predicate using
+=lister-set-marking-predicate=. If this predicate is set, only mark
+items which satisfy it. Setting a new predicate will unmark alreay
+marked items which will not match it.
 
 Note that in the case of walking nodes, =ACTION-FN= requires /two/
 arguments: the ewoc object and the node. The reason behind this is
@@ -490,20 +521,50 @@ position, or one of the symbols =:first=, =:last=, =:next=, =:prev=, or
 ** Sorting
 
 #+begin_src emacs-lisp
-;; Reverse the list items between BEG and END, or the whole list:
-(lister-reverse-list ewoc &optional beg end)
-;; Sort the list according to sorting predicate PRED:
-(lister-sort-list ewoc pred &optional beg end)
-;; The same with sublists:
-(lister-sort-sublist-at ewoc pos pred)
-(lister-sort-sublist-below ewoc pos pred)
+  ;; Reverse the list items between BEG and END, or the whole list:
+  (lister-reverse-list ewoc &optional beg end)
+  ;; Sort the list according to sorting predicate PRED:
+  (lister-sort-list ewoc pred &optional beg end)
+  ;; Sort the list according to mulitple predicates in a row:
+  (lister-sort-list ewoc (list #'comp1 #'comp2) &optional beg end)
+  ;; The same with sublists:
+  (lister-sort-sublist-at ewoc pos pred)
+  (lister-sort-sublist-below ewoc pos pred)
+  ;; Reorder sublists using any kind of predicate:
+  (lister-reorder-sublist-at ewoc pos)
+  (lister-reorder-sublist-below ewoc pos)
+  ;; Note that "reordering" uses a more complicate predicate function
+  ;; than simple sorting. See the documentation of
+  ;; `lister--reorder-wrapped-list' for a more detailed explanation.
 #+end_src
 
-Sorting or reversing a list keeps the individual mark state.
+Sorting or reversing a list keeps the individual mark state. Arguments
+=POS=, =BEG= and =END= can be either an =Ewoc= node, an integer position, or
+one of the symbols =:first=, =:last=, =:next=, =:prev=, or =:point=.
 
-Arguments =POS=, =BEG= and =END= can be either an =Ewoc= node, an integer
-position, or one of the symbols =:first=, =:last=, =:next=, =:prev=, or
-=:point=.
+You can either pass a single comparator to the sorting function (such
+as =string>= or a list of comparators, which then will be applied
+successively (reduction). This is useful for sorting according to
+multiple criteria (e.g. first the name, then within the same name,
+ranking by the income, etc.).
+
+A comparator function has direct access to the list data. So if you
+use a more complex data structure, do not forget to operate on the
+actual criteria and not on the containing object. E.g.:
+
+#+begin_src emacs-lisp
+  (defstruct list-data name income)
+  (defun sort-it (ewoc)
+    (cl-labels ((name> (a b) (string> (list-data-name a)
+                                      (list-data-name b)))
+                (income> (a b) (> (list-data-income a)
+                                  (list-data-income b))))
+      (lister-sort-list ewoc (list #'name> #'income>))))
+  ;; if you use the library dash.el:
+  (defun sort-it (ewoc)
+    (lister-sort-list ewoc (list (-on #'string> #'list-data-name)
+                                 (-on #'>       #'list-data-income))))
+#+end_src
 
 ** Filter
 
@@ -555,17 +616,44 @@ position, or one of the symbols =:first=, =:last=, =:next=, =:prev=, or
 
 #+begin_src emacs-lisp
   ;; From POS, find the next or prev node where the data matches PRED:
-  (lister-next-matching ewoc pos pred)
-  (lister-prev-matching ewoc pos pred)
+  (lister-next-matching ewoc pos pred &optional limit)
+  (lister-prev-matching ewoc pos pred &optional limit)
   ;; same as above, but only consider visible items:
-  (lister-next-visible-matching pos pred)
-  (lister-prev-visible-matching pos pred)
+  (lister-next-visible-matching pos pred &optional limit)
+  (lister-prev-visible-matching pos pred &optional limit)
+;; Find the first or last node of the sublist around POS:
+(lister-top-sublist-node ewoc pos)
+(lister-bottom-sublist-node ewoc pos)
+;; Find the parent of the sublist around POS:
+(lister-parent-node ewoc pos)
+;; Find the first sublist node looking in DIRECTION from POS:
+(lister-first-sublist-node ewoc pos direction)
 #+end_src
 
 Argument =POS= can be either an =Ewoc= node, an integer position, or one
 of the symbols =:first=, =:last=, =:next=, =:prev=, or =:point=.
 
+Argument =limit= is a position (a node, an index value or one of the
+symbols =:first=, =:last=, =:point=, =:next= or =:prev=, which limits the search. The
+search stops when reaching the limit and returns nil, even if the node
+at =limit= matches =pred-fn=.
+
+Note that the generic searching functions (which require a predicate
+function) ignore visibility status, whereas the sublist functions
+listed in this section don't return invisible items. Other sublist
+functions, however, might not check for visibility.
+
 ** Looping 
+
+Most generally, you can access nodes or data items within the body of
+a looping macro or using a function. Most looping facilities come in
+two flavors, marked by the last word of the function name. Functions
+ending with =-list= loop over the item data (that which is printed);
+functions ending with =-nodes= loop over the item node (the =lister--item=
+structure in which the data is stored). As a rule of thumb, you should
+use =-list= functions if you are just concerned with the data, and
+=-nodes= functions if you need to explicitly know if a node is marked or
+invisible. 
 
 Basic macros, imperative style:
 
@@ -590,21 +678,29 @@ To quit the loop immediately, use =(cl-return)=.
 More specific functions, more functional style:
 
 #+begin_src emacs-lisp
-   ;; Collect and maybe map all items between BEG and END:
-   (lister-collect-list ewoc &optional beg end pred-fn map-fn)
-   ;; same with nodes:
-   (lister-collect-nodes ewoc &optional beg end pred-fn map-fn)
-   ;; Modifiy the data and redisplay it:
-   (lister-update-list ewoc action-fn &optional beg end pred-fn)
-   ;; Do something with each node (not item):
-   (lister-walk-nodes ewoc action-fn &optional beg end pred-fn)
-  ;; see also lister-walk-marked-{list/nodes} for looping over all
-  ;; marked items
+  ;; Collect and maybe map all items between BEG and END:
+  (lister-collect-list ewoc &optional beg end pred-fn map-fn)
+  ;; same with nodes:
+  (lister-collect-nodes ewoc &optional beg end pred-fn map-fn)
+  ;; Modifiy the data and redisplay it:
+  (lister-update-list ewoc action-fn &optional beg end pred-fn)
+  ;; Do something with each node (not item):
+  (lister-walk-nodes ewoc action-fn &optional beg end pred-fn)
+  ;; see also (documented somewhere else in that file):
+  ;; - lister-walk-marked-{list/nodes} for looping over all marked items
+  ;; - lister-map for mapping
 #+end_src
 
 All functions operate on the items specified by =BEG= and =END= or on the
 whole list. Optionally operation can be restricted to those items
-matching =PRED-FN=.
+matching =PRED-FN=. 
+
+Note that in the case of =lister-collect-list= and =lister-update-list=,
+=PRED-FN= is called with the item's data (that which is printed), while
+=lister-collect-nodes= and =lister-walk-nodes= operate on the /complete
+node/. In the latter case, =PRED-FN= is called with the complete
+=lister--item= object, the printed data being only one slot of that
+encompassing structure.
 
 When collecting stuff, =map-fn= can be used to further transform the
 data item.
@@ -639,21 +735,47 @@ or one of the symbols =:first=, =:last=, =:next=, =:prev=, or =:point=.
 Argument =POS= can be either an =Ewoc= node, an integer position, or one
 of the symbols =:first=, =:last=, =:next=, =:prev=, or =:point=.
 
+** Modified flag
+Since =Lister= is intended to offer editing facilities, there's also a
+modified flag. It is stored in the buffer local variable
+=lister-local-modified=. 
+
+The modified flag will be set to =t= each time an item is deleted,
+inserted, or its content is changed. Since moving also internally
+works with deleting and inserting, it will also trigger the modified
+flag.
+
+#+begin_src emacs-lisp
+;; Buffer local modified flag
+lister-local-modified
+;; Get the value of the modified flag
+(lister-modified-p ewoc)
+;; Set the value
+(lister-set-modified-p ewoc &optional flag)
+#+end_src
+
+It is recommended to add a variable watcher to display the modified
+flag (e.g. in the header of the list or in the modeline).
+
 ** Miscellaneous 
 
 #+begin_src emacs-lisp
-  ;; Check if the list is empty:
-  (lister-empty-p ewoc)
-  ;; Check if a node is part of the list from beg to end:
-  (lister-node-in-region-p node beg end)
-  ;; Move point:
-  (lister-goto ewoc pos)
-  ;; Manually re-set the level of an item:
-  (lister-set-level-at ewoc pos)
-  (lister-get-level-at ewoc pos)
-  ;; Redisplay an item (e.g. if its data has changed):
-  (lister-refresh-at ewoc pos)
-  (lister-refresh-list ewoc beg end) 
+    ;; Check if the list is empty:
+    (lister-empty-p ewoc)
+    ;; Check if a node is part of the list from beg to end:
+    (lister-node-in-region-p node beg end)
+    ;; Move point:
+    (lister-goto ewoc pos)
+    ;; Manually re-set the level of an item:
+    (lister-set-level-at ewoc pos)
+    (lister-get-level-at ewoc pos)
+    ;; Redisplay an item (e.g. if its data has changed):
+    (lister-refresh-at ewoc pos)
+    (lister-refresh-list ewoc beg end) 
+   ;; Retain position when updating display: Execute BODY, then return
+   ;; to the node at point before BODY.  Useful when updating the
+   ;; display, and the items change (because this moves the cursor)
+   (lister-save-current-node BODY)
 #+end_src
 
 Arguments =POS=, =BEG= and =END= can be either an =Ewoc= node, an integer
@@ -669,17 +791,46 @@ lister-local-left-margin
 ;; level 0 means no padding; level 1 means one time; 2 means 2 time, etc.
 lister-local-padding-string
 #+end_src
+* Known Bugs and Limitations
+
+** Outline Visibility Cycling
+
+Current visibility cycling uses the =invisibility-spec= and is not
+recognized internally by the =lister= commands. So while hiding an item
+using the filter function is mostly taken care of, hiding items using
+=invisibility-spec=  might lead to inconsistent behavior when jumping
+around the list, or when adding or removing items. 
+
 * Changelog
 
-** Current version
- 
+** Current 
+  - Add option "LIMIT" to =lister-next-matching= and
+    =lister-next-visible-matching=
+  - Add hierarchical navigation keys to =lister-mode= (move to parent,
+    move forward or backward same level, move to beginning or end of
+    the sublist), fixing Issue #3
+** 0.9.4
+
+ - Add sorting with multiple predicates / criteria.
+
+** 0.9.3.
+ - Add "modified" flag.
+
+** 0.9.2
+
+ - Add =lister-save-current-node=
+ - Add marking predicate (thanks to Nathanael kinfe)
+ - Add function to get the buffer local ewoc (thanks to Nathanael kinfe)
+ - Add convenience functions to 'reorder' sublists (thanks to
+   Nathanael kinfe)
+ - Add mapping function 
  - New feature: header or footer can now also be a function.
  - New feature: item strings with fields =button= or =field= set will not be
    intangible and can be reached with normal cursor motion, while the
-   rest of the item remains inaccessible
- - Add new public functions =lister-items-marked-p=, =lister-eolp=
- - Bugfixes
-
+   rest of the item remains inaccessible.
+ - Add new public functions =lister-items-marked-p=, =lister-eolp=.
+ - Bugfixes, internal refactoring.
+   
 ** 0.9.1
   - Some bugfixes; add more tests.
   - Added minor-mode.

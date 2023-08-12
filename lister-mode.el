@@ -25,30 +25,33 @@
 
 ;;; Code:
 (require 'lister)
+(require 'view)
 
 ;; Silence compiler warnings
 (defvar lister-local-ewoc)
 
-;; Lazy programmers do not want to type so much.
+;; Convenience macro for defining interactive keys
 (cl-defmacro lister-defkey
     (fn-name (ewoc-var pos-var prefix-var node-var)
              docstring
              &rest body)
-  "Wrap BODY in an interactive defun to be used as a key.
-Define the function using FN-NAME, giving it the documentation
-string DOCSTRING.  When BODY is called in this function, let
-EWOC-VAR be bound to the buffer local ewoc object, POS-VAR to the
-symbol `:point', PREFIX-VAR to the current prefix arg and
-NODE-VAR to the node at point."
+  "Define interactive function FN-NAME with presets for `lister-mode'.
+Define a function using FN-NAME and DOCSTRING.  When executing
+BODY, let EWOC-VAR be bound to the buffer local ewoc object,
+POS-VAR to the symbol `:point', PREFIX-VAR to the current prefix
+arg and NODE-VAR to the node referred to by POS-VAR."
   (declare (indent 2)
            (debug (&define name (symbolp symbolp symbolp symbolp)
                      stringp def-body))
            (doc-string 3))
   `(defun ,fn-name (,ewoc-var ,pos-var &optional ,prefix-var)
      ,(concat docstring
-              "\nIf called interactively, EWOC will be bound to
-the buffer local ewoc object and POS refers to the item at
-point.")
+              (apply #'format
+                     "\n\nIf called interactively and called in a buffer with
+`lister-mode' set, pre-bind %s to the buffer local ewoc object,
+%s to the symbol `:point' and %s to the current prefix argument."
+                     (mapcar (lambda (sym) (upcase (symbol-name sym)))
+                             (list ewoc-var pos-var prefix-var))))
      (interactive (list
                    (or lister-local-ewoc (error "Key only works in a lister buffer"))
                    :point
@@ -58,6 +61,18 @@ point.")
        (if (not ,node-var)
            (error "No item at indicated position")
          ,@body))))
+
+(defun lister-mode--push-goto (ewoc pos)
+  "If point is not at POS, maybe push mark and move point.
+Push mark only if POS is not an immediate visible neighbour of
+the current node.  EWOC is a Lister Ewoc Object."
+  (lister-with-node ewoc pos node
+    (let ((current (lister--parse-position ewoc :point)))
+      (unless (eq node current)
+        (unless (or (eq node (lister--next-node-matching ewoc current #'lister-node-visible-p #'ewoc-next))
+                    (eq node (lister--next-node-matching ewoc current #'lister-node-visible-p #'ewoc-prev)))
+          (push-mark))
+        (lister-goto ewoc node)))))
 
 ;;; * Key Definitions
 
@@ -71,7 +86,7 @@ POS.  If PREFIX is '(16), mark the sublist below POS."
   (pcase prefix
     (`(4)  (lister-mark-unmark-sublist-at ewoc pos state))
     (`(16) (lister-mark-unmark-sublist-below ewoc pos state))
-    (null   (progn
+    ('nil   (progn
              (lister-mark-unmark-at ewoc pos state)
              (lister-goto ewoc :next)))))
 
@@ -113,10 +128,11 @@ unmark all items in the region and ignore PREFIX."
 
 (defun lister-mode-unmark-all ()
   "Unmark all items in the current Lister buffer."
+  (interactive)
   (unless lister-local-ewoc
     (error "Functions needs to be called in a Lister buffer with an Ewoc object"))
-  (lister-walk-marked-nodes (lister-local-ewoc node)
-                            (lambda (node)
+  (lister-walk-marked-nodes lister-local-ewoc
+                            (lambda (ewoc node)
                               (lister-mark-unmark-at ewoc node nil))))
 
 ;; Cycle subtree visibility
@@ -149,7 +165,7 @@ Only move within the same level unless PREFIX is set."
   "Move the item at point to the left."
   (lister-move-item-left ewoc pos))
 
-;; Move subtlists up or down
+;; Move sublists up or down
 
 (lister-defkey lister-mode-sublist-up (ewoc pos prefix node)
   "Move the sublist at point one up."
@@ -167,10 +183,96 @@ Only move within the same level unless PREFIX is set."
   "Move the sublist at point to the left."
   (lister-move-sublist-left ewoc pos))
 
+;; Move within the hierarchy
+
+(defun lister-mode--next-visible-node-same-level (ewoc node move-fn)
+  "Find the next visible node with the same level as NODE.
+EWOC is a Lister Ewoc Object.  MOVE-FN must be either `ewoc-next'
+or `ewoc-prev'."
+  (let* ((ref-level (lister-node-get-level node)))
+    (lister--next-node-matching ewoc node
+                                (lambda (n)
+                                  (and (lister-node-visible-p n)
+                                       (= ref-level (lister-node-get-level n))))
+                                move-fn)))
+
+(lister-defkey lister-mode-backward-same-level (ewoc pos prefix node)
+  "Move backward to the next item with the same level."
+  (if-let ((next (lister-mode--next-visible-node-same-level ewoc node #'ewoc-next)))
+      (lister-mode--push-goto ewoc next)
+    (user-error "No further item with the same level")))
+
+(lister-defkey lister-mode-forward-same-level (ewoc pos prefix node)
+  "Move forward to the next item with the same level."
+  (if-let ((next (lister-mode--next-visible-node-same-level ewoc node #'ewoc-prev)))
+      (lister-mode--push-goto ewoc next)
+    (user-error "No further item with the same level")))
+
+(lister-defkey lister-mode-up-parent (ewoc pos prefix node)
+  "Move up to the parent node."
+  (if-let ((parent (lister-parent-node ewoc pos)))
+      (lister-mode--push-goto ewoc parent)
+    (user-error "No parent found")))
+
+(defun lister-mode--outer-top-sublist-node (ewoc pos)
+  "In EWOC, find the outer top sublist node above POS.
+Return the node or nil if no such node is available."
+  (when-let ((parent (lister-parent-node ewoc pos)))
+    (lister-top-sublist-node ewoc parent)))
+
+(defun lister-mode--outer-bottom-sublist-node (ewoc pos)
+  "In EWOC, find the outer bottom sublistnode below POS.
+Return the node or nil if no such node is available."
+  (lister-with-sublist-at ewoc pos beg end
+    (when-let* ((outer-first (ewoc-next ewoc end))
+                (outer-bounds (lister--locate-sublist ewoc outer-first t)))
+      (nth 1 outer-bounds))))
+
+(lister-defkey lister-mode-goto-beginning (ewoc pos prefix node)
+  "Move up to the beginning of the sublist or list.
+Call this function several times to move out of nested sublists."
+  (let ((top (lister-top-sublist-node ewoc pos)))
+    (when (eq node top)
+      (setq top (lister-mode--outer-top-sublist-node ewoc top)))
+    (if top
+        (lister-mode--push-goto ewoc top)
+      (if-let ((first (lister--next-or-this-node-matching ewoc (lister-get-node-at ewoc :first)
+                                                         #'lister-node-visible-p
+                                                         #'ewoc-next
+                                                         node)))
+          (lister-mode--push-goto ewoc first)
+        (user-error "Beginning of list")))))
+
+(lister-defkey lister-mode-goto-end (ewoc pos prefix node)
+  "Move down to the end of the sublist or list.
+Call this function several times to move out of nested sublists."
+  (let ((bottom (lister-bottom-sublist-node ewoc pos)))
+    (when (eq node bottom)
+      (setq bottom (lister-mode--outer-bottom-sublist-node ewoc bottom)))
+    (if bottom
+        (lister-mode--push-goto ewoc bottom)
+      (if-let ((last (lister--next-or-this-node-matching ewoc (lister-get-node-at ewoc :last)
+                                                         #'lister-node-visible-p
+                                                         #'ewoc-prev
+                                                         node)))
+          (lister-mode--push-goto ewoc last)
+        (user-error "End of list")))))
+
+(lister-defkey lister-mode-next-child-forward (ewoc pos prefix node)
+  "Move to the next child looking up from point."
+  (if-let ((next (lister-first-sublist-node ewoc pos 'up)))
+      (lister-mode--push-goto ewoc next)
+    (user-error "No child found above point")))
+
+(lister-defkey lister-mode-next-child-backward (ewoc pos prefix node)
+  "Move to the next child looking down from point."
+  (if-let ((next (lister-first-sublist-node ewoc pos 'down)))
+      (lister-mode--push-goto ewoc next)
+    (user-error "No child found below point")))
+
 ;; * The Keymap
 (defvar lister-mode-map
   (let ((map (make-sparse-keymap)))
-    (set-keymap-parent map special-mode-map)
     (define-key map "m" 'lister-mode-mark)
     (define-key map "u" 'lister-mode-unmark)
     (define-key map "U" 'lister-mode-unmark-all)
@@ -183,6 +285,14 @@ Only move within the same level unless PREFIX is set."
     (define-key map (kbd "<S-M-down>")  'lister-mode-sublist-down)
     (define-key map (kbd "<S-M-right>") 'lister-mode-sublist-right)
     (define-key map (kbd "<S-M-left>")  'lister-mode-sublist-left)
+    ;;
+    (define-key map [remap beginning-of-buffer] 'lister-mode-goto-beginning)
+    (define-key map [remap end-of-buffer]       'lister-mode-goto-end)
+    (define-key map (kbd "C-c C-u")             'lister-mode-up-parent)
+    (define-key map (kbd "C-c C-f")             'lister-mode-forward-same-level)
+    (define-key map (kbd "C-c C-b")             'lister-mode-backward-same-level)
+    (define-key map (kbd "C-c <C-up>")          'lister-mode-next-child-forward)
+    (define-key map (kbd "C-c <C-down>")        'lister-mode-next-child-backward)
     map)
   "Key map for `lister-mode'.")
 
@@ -190,7 +300,9 @@ Only move within the same level unless PREFIX is set."
   "Bind some keys for basic operations in a lister buffer."
   :lighter "lister "
   :group 'lister
-  :keymap 'lister-mode-map)
+  :keymap lister-mode-map
+  (when (and lister-mode view-mode)
+    (view-mode-exit t)))
 
 (provide 'lister-mode)
 ;;; lister-mode.el ends here

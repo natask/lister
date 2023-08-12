@@ -24,11 +24,16 @@
 ;;; Code:
 
 (require 'lister "lister.el")
+(require 'lister-mode "lister-mode.el")
 (require 'buttercup)
 (require 'seq)
 (require 'cl-lib)
 (require 'cl-extra)
 (require 'rx)
+
+;; TODO Implement custom-matcher "to-return-no-node", checking for nil
+;; and giving more useful feedback if a node has been returned
+
 
 ;; (message "Testing lister version %s on Emacs %s" lister-version emacs-version)
 
@@ -44,18 +49,21 @@ Return the ewoc object"
       (setq-local lister-local-left-margin 0))
     ewoc))
 
-(defun lister-test-get-node-at-point (ewoc)
-  "Return the EWOC node at point.
-Workaround for `ewoc-locate', which does not set the current
-buffer if called with pos=nil."
-  (with-current-buffer (ewoc-buffer ewoc)
-    (ewoc-locate ewoc)))
-
 (defun lister-test-get-data-at-point (ewoc)
   "Return the data of the item at point in EWOC.
 This is functionally equivalent to `lister-get-data-at', but uses
 low-lewel ewoc functions instead of `lister--parse-position'."
-  (lister-get-data-at ewoc (lister-test-get-node-at-point ewoc)))
+  (lister-node-get-data (with-current-buffer (ewoc-buffer ewoc)
+                          (ewoc-locate ewoc))))
+
+(defun lister-test-node-data-pred (value)
+  "Build function matching a lister node's data having VALUE."
+  (lambda (n) (equal (lister-node-get-data n)
+                     value)))
+
+(defun lister-test-data-pred (value)
+  "Build function matching item having VALUE."
+  (lambda (item) (equal value item)))
 
 (defun lister-test-only-visible-content (buf)
   "Return only content from BUF which is not marked as invisible."
@@ -75,12 +83,26 @@ low-lewel ewoc functions instead of `lister--parse-position'."
 
 ;;; * Custom Matchers
 
+;; to match nodes by data:
+(buttercup-define-matcher :to-be-node-with-data (node1 node2)
+  (let* ((n1      (funcall node1))
+         (n1-data (lister-node-get-data n1))
+         (n2-data (funcall node2)))
+    (buttercup--test-expectation
+        (equal n1-data n2-data)
+      :expect-match-phrase
+      (format "Expected node data to be %s, but instead it was %s"
+              n2-data (if n1 n1-data "no node at all"))
+      :expect-mismatch-phrase
+      (format "Expected node data not to be '%s', but instead it was"
+              n2-data))))
+
 ;; to match nodes:
 (buttercup-define-matcher :to-be-node (node1 node2)
   (let* ((n1   (funcall node1))
          (n2   (funcall node2))
-         (n1-data (when n1 (lister--item-data (ewoc-data n1))))
-         (n2-data (when n2 (lister--item-data (ewoc-data n2)))))
+         (n1-data (when n1 (lister-node-get-data n1)))
+         (n2-data (when n2 (lister-node-get-data n2))))
     (buttercup--test-expectation
         (equal n1 n2)
       :expect-match-phrase
@@ -89,6 +111,53 @@ low-lewel ewoc functions instead of `lister--parse-position'."
       :expect-mismatch-phrase
       (format "Expected node not to be '%s', but instead it was"
               n2-data))))
+
+(defun lister-test--map-nodes (n)
+  (mapcar #'lister-node-get-data n))
+
+(buttercup-define-matcher :to-be-nodes (a b)
+  (cl-destructuring-bind
+      ((a-expr . a) (b-expr . b))
+      (mapcar #'buttercup--expr-and-value (list a b))
+    (let* ((a-uniques (cl-set-difference a b :test #'equal))
+           (b-uniques (cl-set-difference b a :test #'equal))
+           (spec (format-spec-make
+                  ?A (format "%S" a-expr)
+                  ?a (format "%S" (lister-test--map-nodes a))
+                  ?B (format "%S" b-expr)
+                  ?b (format "%S" (lister-test--map-nodes b))
+                  ?m (format "%S" (lister-test--map-nodes b-uniques))
+                  ?p (format "%S" (lister-test--map-nodes a-uniques)))))
+      (cond
+       ((and a-uniques b-uniques)
+        (cons nil (buttercup-format-spec
+                   "Expected `%A' to contain the same nodes as `%b', but `%m' are missing and `%p' are present unexpectedly in `%a'."
+                   spec)))
+       (a-uniques
+        (cons nil (buttercup-format-spec
+                   "Expected `%A' to contain the same nodes as `%b', but `%p' are present unexpectedly in `%a'."
+                   spec)))
+       (b-uniques
+        (cons nil (buttercup-format-spec
+                   "Expected `%A' to contain the same nodes as `%b', but `%m' are missing in `%a'."
+                   spec)))
+       (t
+        (cons t (buttercup-format-spec
+                 "Expected `%A' not to have same nodes as `%b'"
+                 spec)))))))
+
+;; to match position of point in list:
+(buttercup-define-matcher :to-have-point-at-item (ewoc data)
+  (let* ((ewoc-value (funcall ewoc))
+         (data-value (funcall data))
+         (ewoc-data  (lister-test-get-data-at-point ewoc-value)))
+    (buttercup--test-expectation
+        (equal ewoc-data data-value)
+      :expect-match-phrase (format "Expected point to be at item `%s', but it was at `%s'"
+                                   data-value ewoc-data)
+      :expect-mismatch-phrase (format "Expected point not to be at item `%s', but it was."
+                                      ewoc-data))))
+
 
 ;; to match buffer contents:
 (buttercup-define-matcher :to-have-as-content (buf content-to-be)
@@ -119,7 +188,7 @@ low-lewel ewoc functions instead of `lister--parse-position'."
               expected-content))))
 
 ;; -----------------------------------------------------------
-;; The tests.
+;; * Tests for lister.el
 
 ;;; * Set up
 (describe "Set up:"
@@ -155,7 +224,7 @@ low-lewel ewoc functions instead of `lister--parse-position'."
     (setq item "ITEM"))
   (after-each
     (kill-buffer (ewoc-buffer ewoc)))
-  
+
   (describe "lister-empty-p:"
     (it "returns t when list is empty:"
       (expect (lister-empty-p ewoc)
@@ -234,7 +303,32 @@ low-lewel ewoc functions instead of `lister--parse-position'."
         (expect (lister-get-list ewoc beg end)
                 :to-equal '("A" "B" "C" "D")))))
 
-  (describe "lister-add:"
+  (describe "lister-map"
+    (it "maps a flat list"
+      (lister-set-list ewoc l)
+      (cl-labels ((map-fn (s)
+                          (concat "MAPPED" s)))
+        (expect (lister-map ewoc #'map-fn)
+                :to-equal (mapcar #'map-fn l))))
+    (it "maps a flat list with predicate"
+      (lister-set-list ewoc l)
+      (cl-labels ((map-fn (s)
+                          (concat "MAPPED" s))
+                  (pred-fn (s)
+                           (string= "A" s)))
+        (expect (lister-map ewoc #'map-fn #'pred-fn)
+                :to-equal '("MAPPEDA"))))
+
+    (it "maps a hierarchical list"
+      (let ((l '("A" "B" "C" ("D" "E" "F"))))
+        (lister-set-list ewoc l)
+        (cl-labels ((map-fn (s)
+                            (concat "MAPPED" s)))
+          (expect (lister-map ewoc #'map-fn)
+                  :to-equal '("MAPPEDA" "MAPPEDB" "MAPPEDC"
+                              ("MAPPEDD" "MAPPEDE" "MAPPEDF")))))))
+
+  (describe "lister-add"
     (it "adds a single item to an empty list:"
       (lister-add ewoc item)
       (expect (lister-get-list ewoc)
@@ -353,7 +447,46 @@ low-lewel ewoc functions instead of `lister--parse-position'."
       (expect (lister-empty-p ewoc) :to-be-truthy))
     (it "replaces an empty list with a new list:"
       (lister-replace-list ewoc '("1" "2") nil nil)
-      (expect (lister-get-list ewoc) :to-equal '("1" "2")))))
+      (expect (lister-get-list ewoc) :to-equal '("1" "2"))))
+
+
+  ;; TODO Add tests for -update; -delete-marked
+  (describe "modified flag:"
+    (describe "lister-setup"
+      (it "returns buffer with modified set to nil"
+        (expect (lister-modified-p ewoc) :not :to-be-truthy)))
+    (describe "lister-insert"
+      (it "sets modified flag"
+        (lister-insert ewoc :first "TEST")
+        (expect (lister-modified-p ewoc) :to-be-truthy)))
+    (describe "lister-replace-at"
+      (it "sets modified flag"
+        (lister-insert ewoc :first "TEST")
+        (lister-set-modified-p ewoc nil)
+        (expect (lister-modified-p ewoc) :not :to-be-truthy)
+        (lister-replace-at ewoc :first "NEW ITEM")
+        (expect (lister-modified-p ewoc) :to-be-truthy)))
+    (describe "lister-delete-at"
+      (it "sets modified flag"
+        (lister-insert ewoc :first "TEST")
+        (lister-set-modified-p ewoc nil)
+        (expect (lister-modified-p ewoc) :not :to-be-truthy)
+        (lister-delete-at ewoc :first)
+        (expect (lister-modified-p ewoc) :to-be-truthy)))
+    (describe "lister-delete-list"
+      (it "sets modified flag"
+        (lister-insert-list ewoc :first '("A" "B" "C"))
+        (lister-set-modified-p ewoc nil)
+        (expect (lister-modified-p ewoc) :not :to-be-truthy)
+        (lister-delete-list ewoc :first :last)
+        (expect (lister-modified-p ewoc) :to-be-truthy)))
+    (describe "lister-delete-all"
+      (it "sets modified flag"
+        (lister-insert-list ewoc :first '("A" "B" "C"))
+        (lister-set-modified-p ewoc nil)
+        (expect (lister-modified-p ewoc) :not :to-be-truthy)
+        (lister-delete-all ewoc)
+        (expect (lister-modified-p ewoc) :to-be-truthy)))))
 
 ;;; * Setting and removing header/footer
 
@@ -595,39 +728,79 @@ low-lewel ewoc functions instead of `lister--parse-position'."
     (after-each
       (kill-buffer (ewoc-buffer ewoc)))
 
+    (it "returns the whole list boundaries if there is no sublist"
+      (lister-set-list ewoc '("0" "1" "2" "3" "4" "5" "6"))
+      (let ((expected-bounds (list (lister--parse-position ewoc :first)
+                                   (lister--parse-position ewoc :last))))
+        (expect (lister--locate-sublist ewoc 2)
+                :to-be-nodes expected-bounds)))
+    (it "returns nil if there are no list items"
+      (lister-delete-all ewoc)
+      (expect (lister--locate-sublist ewoc :first)
+              :to-be nil))
+    (it "throws an error if POS is out of bounds"
+      (lister-set-list ewoc '("0" "1"))
+      (expect (lister--locate-sublist ewoc 2)
+              :to-throw))
     (it "identifies a surrounded sublist:"
       (lister-set-list ewoc '("0" "1" ("2" "3" "4" "5") "4" "5"))
       (let ((expected-bounds (list (ewoc-nth ewoc 2)
                                    (ewoc-nth ewoc 5))))
         (expect (lister--locate-sublist ewoc 2)
-                :to-equal expected-bounds)
+                :to-be-nodes expected-bounds)
         (expect (lister--locate-sublist ewoc 3)
-                :to-equal expected-bounds)
+                :to-be-nodes expected-bounds)
         (expect (lister--locate-sublist ewoc 4)
-                :to-equal expected-bounds)
+                :to-be-nodes expected-bounds)
         (expect (lister--locate-sublist ewoc 5)
-                :to-equal expected-bounds)))
+                :to-be-nodes expected-bounds)))
     (it "identifies a sublist with 'open end':"
       (lister-set-list ewoc '("0" "1"
                            ("2" "3" "4" "5")))
       (let ((expected-bounds (list (ewoc-nth ewoc 2)
                                    (ewoc-nth ewoc 5))))
         (expect (lister--locate-sublist ewoc 2)
-                :to-equal expected-bounds)
+                :to-be-nodes expected-bounds)
         (expect (lister--locate-sublist ewoc 3)
-                :to-equal expected-bounds)
+                :to-be-nodes expected-bounds)
         (expect (lister--locate-sublist ewoc 4)
-                :to-equal expected-bounds)
+                :to-be-nodes expected-bounds)
         (expect (lister--locate-sublist ewoc 5)
-                :to-equal expected-bounds)))
-    (it "identifies a surrounded nested  sublist:"
+                :to-be-nodes expected-bounds)))
+    (it "identifies a surrounded nested sublist:"
       (lister-set-list ewoc '("0" ("1" ("2" "3") "4" "5")))
       (let ((expected-bounds (list (ewoc-nth ewoc 2)
                                    (ewoc-nth ewoc 3))))
         (expect (lister--locate-sublist ewoc 2)
-                :to-equal expected-bounds)
+                :to-be-nodes expected-bounds)
         (expect (lister--locate-sublist ewoc 3)
-                :to-equal expected-bounds))))
+                :to-be-nodes expected-bounds)))
+    (it "skips filtered items if asked for"
+      (lister-set-list ewoc '("0" ("A" "A" "3" "4") "5"))
+      (lister-set-filter ewoc (lambda (s) (equal s "A")))
+      (let ((expected-bounds (list (ewoc-nth ewoc 3)
+                                   (ewoc-nth ewoc 4))))
+        (expect (lister--locate-sublist ewoc 2 :only-visible)
+                :to-be-nodes expected-bounds)))
+    (it "returns the only visible item if the rest of the sublist is filtered"
+      (lister-set-list ewoc '("0" ("A" "A" "3" "A") "5"))
+      (lister-set-filter ewoc (lambda (s) (equal s "A")))
+      (let ((expected-bounds (list (ewoc-nth ewoc 3)
+                                   (ewoc-nth ewoc 3))))
+      (expect (lister--locate-sublist ewoc 2 :only-visible)
+              :to-be-nodes expected-bounds)))
+    (it "returns nil if the complete list is invisible"
+      (lister-set-list ewoc '("A" ("A" "A" "A" "A") "A"))
+      (lister-set-filter ewoc (lambda (s) (equal s "A")))
+      (expect (lister--locate-sublist ewoc 2 :only-visible)
+              :to-be nil))
+    (it "returns first and last if all sublist items are filtered"
+      (lister-set-list ewoc '("0" ("A" "A" "A" "A") "5"))
+      (lister-set-filter ewoc (lambda (s) (equal s "A")))
+      (let ((expected-bounds (list (ewoc-nth ewoc 0)
+                                   (ewoc-nth ewoc 5))))
+      (expect (lister--locate-sublist ewoc 2 :only-visible)
+              :to-be-nodes expected-bounds))))
 
   (describe "lister-get-sublist-at:"
     (it "returns a sublist:"
@@ -692,10 +865,7 @@ low-lewel ewoc functions instead of `lister--parse-position'."
 
 ;;; * Movement / Navigation
 
-;; - lister-goto
-  ;; - with-locked-cursor
-
-(describe "Navigation:"
+(describe "Movement ('Finding') and Navigation:"
   :var (ewoc l)
   (before-each
     (setq ewoc (lister-test-setup-minimal-buffer))
@@ -704,189 +874,295 @@ low-lewel ewoc functions instead of `lister--parse-position'."
   (after-each
     (kill-buffer (ewoc-buffer ewoc)))
 
+  (describe "lister--next-node-matching"
+    (it "returns the node matching PRED-FN looking down"
+      (expect (lister--next-node-matching ewoc (ewoc-nth ewoc 0)
+                                          (lister-test-node-data-pred "4")
+                                          #'ewoc-next)
+              :to-be-node (lister-get-node-at ewoc 4)))
+    (it "returns the node matching PRED-FN looking up"
+      (expect (lister--next-node-matching ewoc (ewoc-nth ewoc -1)
+                                          (lister-test-node-data-pred "1")
+                                          #'ewoc-prev)
+              :to-be-node (lister-get-node-at ewoc 1)))
+    (it "returns nil if no matching node is found looking down"
+      (expect (lister--next-node-matching ewoc (ewoc-nth ewoc 0)
+                                          #'ignore
+                                          #'ewoc-next)
+              :to-be nil))
+    (it "returns nil if no matching node is found looking up"
+      (expect (lister--next-node-matching ewoc (ewoc-nth ewoc -1)
+                                          #'ignore
+                                          #'ewoc-prev)
+              :to-be nil))
+    (it "ignores the starting node matching PRED-FN"
+      (expect (lister--next-node-matching ewoc (ewoc-nth ewoc 0)
+                                          (lister-test-node-data-pred "0")
+                                          #'ewoc-next)
+              :to-be nil))
+    (it "stops searching when node LIMIT is reached"
+      (expect (lister--next-node-matching ewoc (ewoc-nth ewoc 0)
+                                          (lister-test-node-data-pred "3")
+                                          #'ewoc-next
+                                          (lister-get-node-at ewoc 2))
+              :to-be nil))
+    (it "cancels searching even if LIMIT matches PRED-FN"
+      (expect (lister--next-node-matching ewoc (ewoc-nth ewoc 0)
+                                          (lister-test-node-data-pred "3")
+                                          #'ewoc-next
+                                          (lister-get-node-at ewoc 3))
+              :to-be nil)))
+
+  (describe "lister--next-or-this-node-matching"
+    (it "returns the node matching PRED-FN looking down"
+      (expect (lister--next-or-this-node-matching ewoc (ewoc-nth ewoc 0)
+                                                  (lister-test-node-data-pred "3")
+                                                  #'ewoc-next)
+              :to-be-node (lister-get-node-at ewoc 3)))
+    (it "returns the node matching PRED-FN looking up"
+      (expect (lister--next-or-this-node-matching ewoc (ewoc-nth ewoc -1)
+                                                  (lister-test-node-data-pred "2")
+                                                  #'ewoc-prev)
+              :to-be-node (lister-get-node-at ewoc 2)))
+    (it "returns the starting node matching PRED-FN looking down"
+      (expect (lister--next-or-this-node-matching ewoc (ewoc-nth ewoc 0)
+                                                  (lister-test-node-data-pred "0")
+                                                  #'ewoc-next)
+              :to-be-node (lister-get-node-at ewoc 0)))
+    (it "returns the starting node matching PRED-FN looking up"
+      (expect (lister--next-or-this-node-matching ewoc (ewoc-nth ewoc -1)
+                                                  (lister-test-node-data-pred "5")
+                                                  #'ewoc-prev)))
+    (it "stops searching before reaching LIMIT"
+      (expect (lister--next-or-this-node-matching ewoc (ewoc-nth ewoc 0)
+                                                  (lister-test-node-data-pred "4")
+                                                  #'ewoc-next
+                                                  (lister-get-node-at ewoc 3))
+              :to-be nil))
+    (it "stops searching at LIMIT matching PRED-FN"
+      (expect (lister--next-or-this-node-matching ewoc (ewoc-nth ewoc 0)
+                                                  (lister-test-node-data-pred "3")
+                                                  #'ewoc-next
+                                                  (lister-get-node-at ewoc 3))
+              :to-be nil)))
+
   (describe "lister-goto:"
     (it "moves point to the first item of the list:"
       (lister-goto ewoc :first)
-      (expect (lister-test-get-data-at-point ewoc)
-              :to-equal "0"))
+      (expect ewoc :to-have-point-at-item "0"))
     (it "moves point to the last item of the list:"
       (lister-goto ewoc :last)
-      (expect (lister-test-get-data-at-point ewoc)
-              :to-equal "5"))
+      (expect ewoc :to-have-point-at-item "5"))
     (it "moves point to the next item:"
       (lister-goto ewoc :first)
       (lister-goto ewoc :next)
-      (expect (lister-test-get-data-at-point ewoc)
-              :to-equal "1"))
+      (expect ewoc :to-have-point-at-item "1"))
     (it "moves point to the prev item:"
       (lister-goto ewoc :last)
       (lister-goto ewoc :prev)
-      (expect (lister-test-get-data-at-point ewoc))
-              :to-equal "4"))
+      (expect ewoc :to-have-point-at-item "4"))
     (it "moves point to an index position:"
       (lister-goto ewoc 4)
-      (expect (lister-test-get-data-at-point ewoc)
-              :to-equal "4"))
+      (expect ewoc :to-have-point-at-item "4"))
     (it "throws an error if index is out of bounds:"
       (expect (lister-goto ewoc 8)
               :to-throw)))
 
-;; * Editing
+  (describe "lister-top-sublist-node"
+    (it "finds the first sublist node"
+      (lister-set-list ewoc '("A" "B" ("AA" "BB" "CC" "DD") "C" ))
+      (expect (lister-top-sublist-node ewoc 5)
+              :to-be-node-with-data "AA"))
+    (it "moves to the top node if there is no sublist"
+      (expect (lister-top-sublist-node ewoc 4)
+              :to-be-node-with-data "0"))
+    (it "does nothing if there is no list"
+      (lister-set-list ewoc nil)
+      (expect (lister-top-sublist-node ewoc :point) :to-be nil)))
 
-;; - move-item-up, move-item-down
+  (describe "lister-bottom-sublist-node"
+    (it "moves to the last sublist node"
+      (lister-set-list ewoc '("A" "B" ("AA" "BB" "CC" "DD") "C"))
+      (expect (lister-bottom-sublist-node ewoc 5) :to-be-node-with-data "DD"))
+    (it "does nothing if there is no list"
+      (lister-set-list ewoc nil)
+      (expect (lister-bottom-sublist-node ewoc :point) :to-be nil))
+    (it "moves to the last node if there is no sublist"
+      (expect (lister-bottom-sublist-node ewoc 3) :to-be-node-with-data "5")))
 
+  (describe "lister-parent-node"
+    (before-each
+      ;;                       0   1    2    3   4     5       6     7
+      (lister-set-list ewoc '("A" "B" ("AA" "BB" "CC" ("AAA" "BBB") "DD") "C" "D"))
+      (lister-set-filter ewoc nil))
+    (it "finds the parent node"
+      (expect (lister-parent-node ewoc 4) :to-be-node-with-data "B"))
+    (it "finds the parent node in a nested list"
+      (expect (lister-parent-node ewoc 6) :to-be-node-with-data "CC"))
+    (it "moves to the top node when called on a 0 level node"
+      (expect (lister-parent-node ewoc 1) :to-be-node-with-data "A"))
+    (it "moves to the top node when called from below a sublist"
+      (expect (lister-parent-node ewoc 8) :to-be-node-with-data "A"))
+    (it "skips real parent node since it is invisible"
+      (lister-set-filter ewoc (lambda (s) (equal s "B")))
+      (expect (lister-parent-node ewoc 3) :to-be-node-with-data "A"))
+    (it "throws an error if all parent nodes are invisible"
+      (lister-set-filter ewoc (lambda (s) (or (equal s "A")
+                                              (equal s "B"))))
+      (expect (lister-parent-node ewoc 2) :to-be nil))
+    (it "moves to the first sublist node if all parent nodes are invisible"
+      (lister-set-filter ewoc (lambda (s) (or (equal s "A")
+                                              (equal s "B"))))
+      (expect (lister-parent-node ewoc 3) :to-be-node-with-data "AA")))
+
+  (describe "lister-first-sublist-node"
+    (before-each
+      ;;                       0   1    2    3   4     5       6     7
+      (lister-set-list ewoc '("A" "B" ("AA" "BB" "CC" ("AAA" "BBB") "DD") "C" "D")))
+    (it "returns nilif no sublist item is available"
+      (expect (lister-first-sublist-node ewoc 5 'down) :to-be nil)
+      (expect (lister-first-sublist-node ewoc 5 'up)   :to-be nil))
+    (it "moves to first sublist item"
+      (expect (lister-first-sublist-node ewoc :first 'down) :to-be-node-with-data "AA")
+      (expect (lister-first-sublist-node ewoc :last 'up)  :to-be-node-with-data "DD"))
+    (it "moves to nested sublist item"
+      (expect (lister-first-sublist-node ewoc (lister-first-sublist-node ewoc :first 'down) 'down) :to-be-node-with-data "AAA")
+      (expect (lister-first-sublist-node ewoc (lister-first-sublist-node ewoc :last 'up) 'up) :to-be-node-with-data "BBB"))))
 
 ;;; * Filter
 
 (describe "Filter:"
-  :var (ewoc l pred-fn filter-a)
+  :var (ewoc l pred-fn
+             filter-a filter-non-a
+             filter-b
+             filter-i filter-non-i
+             filter-2nd
+             filter-*)
   (before-each
     (setq ewoc (lister-test-setup-minimal-buffer))
     (setq l    '("AZ" "BAZ" "DAZ" "MAZ"
                  ("ITEM4" "ITEM5" "ITEM6")
                  "HEY" "THEY" "OBEY"))
-    ;; filters the first 4 items:
-    (setq filter-a (apply-partially #'string-match "A"))
-    ;; filters the second item:
-    (setq filter-2nd (apply-partially #'string-match-p "BAZ"))
-    ;; filter everything but the first 4:
-    (setq filter-non-a (lambda (s)
-                         (not (string-match "A" s))))
-    ;; filters the last 3 items:
-    (setq filter-b (apply-partially #'string-match "Y"))
-    ;; filters the sublist:
-    (setq filter-i (apply-partially #'string-match "ITEM"))
-    ;; filters everything but the sublist:
-    (setq filter-non-i (lambda (s)
-                         (not (funcall filter-i s))))
-    ;; filters everything:
-    (setq filter-* (apply-partially #'string-match ".*")))
+    (lister-set-list ewoc l)
+    (setq filter-a     (apply-partially #'string-match "A")
+          filter-2nd   (apply-partially #'string-match-p "BAZ")
+          filter-non-a (lambda (s) (not (string-match "A" s)))
+          filter-b     (apply-partially #'string-match "Y")
+          filter-i     (apply-partially #'string-match "ITEM")
+          filter-non-i (lambda (s) (not (funcall filter-i s)))
+          filter-*     (apply-partially #'string-match ".*")))
   (after-each
     (kill-buffer (ewoc-buffer ewoc)))
 
   (describe "Finding nodes while filter is OFF:"
     (describe "lister--next-visible-node:"
       (it "moves to the next node:"
-        (lister-set-list ewoc l)
-        (let ((node (ewoc-nth ewoc 0)))
-          (expect (lister--next-visible-node ewoc node)
-                  :to-be-node (ewoc-nth ewoc 1))))
+        (expect (lister--next-visible-node ewoc (ewoc-nth ewoc 0))
+                :to-be-node (ewoc-nth ewoc 1)))
       (it "moves to prev node:"
-        (lister-set-list ewoc l)
-        (let ((node (ewoc-nth ewoc -1)))
-          (expect (lister--next-visible-node ewoc node #'ewoc-prev)
-                  :to-be-node (ewoc-nth ewoc -2))))
+          (expect (lister--next-visible-node ewoc (ewoc-nth ewoc -1) #'ewoc-prev)
+                  :to-be-node (ewoc-nth ewoc -2)))
       (it "returns nil if already at last node:"
-        (lister-set-list ewoc l)
-        (let ((node (ewoc-nth ewoc -1)))
-          (expect (lister--next-visible-node ewoc node)
-                  :to-be nil)))
+        (expect (lister--next-visible-node ewoc (ewoc-nth ewoc -1))
+                :to-be nil))
       (it "returns nil if already at first node:"
-        (lister-set-list ewoc l)
-        (let ((node (ewoc-nth ewoc 0)))
-          (expect (lister--next-visible-node ewoc node #'ewoc-prev)
-                  :to-be nil))))
-
+        (expect (lister--next-visible-node ewoc (ewoc-nth ewoc 0) #'ewoc-prev)
+                :to-be nil)))
     (describe "lister--first-visible-node:"
       (it "returns first node:"
-        (lister-set-list ewoc l)
         (expect (lister--first-visible-node ewoc)
                 :to-be-node (ewoc-nth ewoc 0))))
-
     (describe "lister--last-visible-node:"
       (it "returns last node:"
-        (lister-set-list ewoc l)
         (expect (lister--last-visible-node ewoc)
                 :to-be-node (ewoc-nth ewoc -1))))
-
     (describe "lister-next-matching"
       (it "finds next node matching a data predicate:"
-        (lister-set-list ewoc l)
-        (let ((pred (lambda (s) (string-match-p "ITEM4" s))))
-          (expect (lister-next-matching ewoc
-                                        :first
-                                        pred)
-                  :to-be-node (ewoc-nth ewoc 4)))))
-
+        (expect (lister-next-matching ewoc :first
+                                      (lister-test-data-pred "ITEM4"))
+                :to-be-node (ewoc-nth ewoc 4)))
+      (it "stops when reaching LIMIT"
+        (expect (lister-next-matching ewoc :first
+                                      (lister-test-data-pred "ITEM5")
+                                      3)
+                :to-be nil))
+      (it "ignores LIMIT even if it matches PRED-FN"
+        (expect (lister-next-matching ewoc :first
+                                      (lister-test-data-pred "ITEM5")
+                                      5)
+                :to-be nil)))
     (describe "lister-prev-matching"
       (it "finds prev node matching a data predicate:"
-        (lister-set-list ewoc l)
-        (let ((pred (lambda (s) (string-match-p "ITEM4" s))))
-          (expect (lister-prev-matching ewoc :last pred)
-                  :to-be-node (ewoc-nth ewoc 4))))))
+        (expect (lister-prev-matching ewoc :last
+                                      (lister-test-data-pred "ITEM4"))
+                :to-be-node (ewoc-nth ewoc 4))))
+    (describe "Hide visible items:"
+      (describe "lister-set-filter:"
+        (it "hides all items:"
+          (lister-set-list ewoc l)
+          (lister-set-filter ewoc filter-*)
+          (expect (ewoc-buffer ewoc)
+                  :to-have-as-visible-content "")))))
 
-  (describe "Hide visible items:"
-    (describe "lister-set-filter:"
-      (it "hides all items:"
-        (lister-set-list ewoc l)
-        (lister-set-filter ewoc filter-*)
-        (expect (ewoc-buffer ewoc)
-                :to-have-as-visible-content ""))))
-
-  (describe "Finding nodes while filter is ON:"
-    (describe "lister--first-visible-node:"
-      (it "finds the first visible node with filter-a:"
-        (lister-set-list ewoc l)
-        (lister-set-filter ewoc filter-a)
-        (expect (lister--first-visible-node ewoc)
-                :to-be-node (ewoc-nth ewoc 4)))
-      (it "finds the first visible node with filter-b:"
-        (lister-set-list ewoc l)
-        (lister-set-filter ewoc filter-b)
-        (expect (lister--first-visible-node ewoc)
-                :to-be-node (ewoc-nth ewoc 0)))
-      (it "returns nil if everything is hidden:"
-        (lister-set-list ewoc l)
-        (lister-set-filter ewoc filter-*)
-        (expect (lister--first-visible-node ewoc)
-                :to-be nil)))
-
-    (describe "lister--last-visible-node:"
-      (it "finds the last visible node with filter-a:"
-        (lister-set-list ewoc l)
-        (lister-set-filter ewoc filter-a)
-        (expect (lister--last-visible-node ewoc)
-                :to-be-node (ewoc-nth ewoc -1)))
-      (it "finds the last visible node with filter-b:"
-        (lister-set-list ewoc l)
-        (lister-set-filter ewoc filter-b)
-        (expect (lister--last-visible-node ewoc)
-                :to-be-node (ewoc-nth ewoc 6)))
-      (it "returns nil if everyhing is hidden:"
-        (lister-set-list ewoc l)
-        (lister-set-filter ewoc filter-*)
-        (expect (lister--last-visible-node ewoc)
-                :to-be nil)))
-
-    (describe "lister-next-visible-matching:"
-      (it "skips hidden nodes when searching for an item:"
-        (lister-set-list ewoc l)
-        (lister-set-filter ewoc filter-2nd)
-        (let ((pred (lambda (s) (string-match-p "AZ" s))))
-          (expect (lister-next-visible-matching ewoc :first pred)
-                  :to-be-node (ewoc-nth ewoc 2))))
-      (it "returns nil when searching for an hidden item:"
-        (lister-set-list ewoc l)
-        (lister-set-filter ewoc filter-i)
-        (let ((pred (lambda (s) (string-match-p "ITEM4" s))))
-          (expect (lister-next-visible-matching ewoc :first pred)
-                  :to-be nil))))
-
-    (describe "lister-prev-visible-matching"
-      (it "skips hidden nodes when searching for an item:"
-        (lister-set-list ewoc l)
-        (lister-set-filter ewoc filter-2nd)
-        (let ((pred (lambda (s) (string-match-p "AZ" s))))
-          (expect (lister-prev-visible-matching ewoc 2 pred)
-                  :to-be-node (ewoc-nth ewoc 0))))
-      (it "returns nil when searching for a hiden item:"
-        (lister-set-list ewoc l)
-        (lister-set-filter ewoc filter-i)
-        (let ((pred (lambda (s) (string-match-p "ITEM4" s))))
-          (expect (lister-prev-visible-matching ewoc :last pred)
-                  :to-be nil)))))
-
-
+    (describe "Finding nodes while filter is ON:"
+      (describe "lister--first-visible-node:"
+        (it "finds the first visible node with filter-a:"
+          (lister-set-list ewoc l)
+          (lister-set-filter ewoc filter-a)
+          (expect (lister--first-visible-node ewoc)
+                  :to-be-node (ewoc-nth ewoc 4)))
+        (it "finds the first visible node with filter-b:"
+          (lister-set-list ewoc l)
+          (lister-set-filter ewoc filter-b)
+          (expect (lister--first-visible-node ewoc)
+                  :to-be-node (ewoc-nth ewoc 0)))
+        (it "returns nil if everything is hidden:"
+          (lister-set-list ewoc l)
+          (lister-set-filter ewoc filter-*)
+          (expect (lister--first-visible-node ewoc)
+                  :to-be nil)))
+      (describe "lister--last-visible-node:"
+        (it "finds the last visible node with filter-a:"
+          (lister-set-list ewoc l)
+          (lister-set-filter ewoc filter-a)
+          (expect (lister--last-visible-node ewoc)
+                  :to-be-node (ewoc-nth ewoc -1)))
+        (it "finds the last visible node with filter-b:"
+          (lister-set-list ewoc l)
+          (lister-set-filter ewoc filter-b)
+          (expect (lister--last-visible-node ewoc)
+                  :to-be-node (ewoc-nth ewoc 6)))
+        (it "returns nil if everyhing is hidden:"
+          (lister-set-list ewoc l)
+          (lister-set-filter ewoc filter-*)
+          (expect (lister--last-visible-node ewoc)
+                  :to-be nil)))
+      (describe "lister-next-visible-matching:"
+        (it "skips hidden nodes when searching for an item:"
+          (lister-set-list ewoc l)
+          (lister-set-filter ewoc filter-2nd)
+          (let ((pred (lambda (s) (string-match-p "AZ" s))))
+            (expect (lister-next-visible-matching ewoc :first pred)
+                    :to-be-node (ewoc-nth ewoc 2))))
+        (it "returns nil when searching for an hidden item:"
+          (lister-set-list ewoc l)
+          (lister-set-filter ewoc filter-i)
+          (let ((pred (lambda (s) (string-match-p "ITEM4" s))))
+            (expect (lister-next-visible-matching ewoc :first pred)
+                    :to-be nil))))
+      (describe "lister-prev-visible-matching"
+        (it "skips hidden nodes when searching for an item:"
+          (lister-set-list ewoc l)
+          (lister-set-filter ewoc filter-2nd)
+          (let ((pred (lambda (s) (string-match-p "AZ" s))))
+            (expect (lister-prev-visible-matching ewoc 2 pred)
+                    :to-be-node (ewoc-nth ewoc 0))))
+        (it "returns nil when searching for a hiden item:"
+          (lister-set-list ewoc l)
+          (lister-set-filter ewoc filter-i)
+          (let ((pred (lambda (s) (string-match-p "ITEM4" s))))
+            (expect (lister-prev-visible-matching ewoc :last pred)
+                    :to-be nil)))))
   (describe "retreiving lists with filter ON:"
     (describe "lister-get-list:"
       (it "returns complete list if everything is hidden:"
@@ -937,22 +1213,6 @@ low-lewel ewoc functions instead of `lister--parse-position'."
         (expect (lister--item-visible (ewoc-data
                                     (lister-get-node-at ewoc :last)))
                 :to-be-truthy)))))
-
-  ;; - with-locked-cursor
-  ;;     "keeps the visual line if the item is filtered away in its body"
-  ;;    "jumps to the last visible line if the current line has been filtered away in the body"
-  ;;    "jumps to the first line if the body filters all items"
-
-
-;; * Levels and indentation
-
-  ;; - insert
-  ;;   - does not allow indentation > 0 at top
-  ;;   - inherits indentation from previous item
-  ;;   - does not allow indentation difference > 1 at non-top item
-  ;;  - replace
-  ;;    - can chang indentation level
-
 
 ;; * Sorting
 
@@ -1027,6 +1287,20 @@ low-lewel ewoc functions instead of `lister--parse-position'."
         (lister-sort-list ewoc #'string>)
         (expect (lister-get-list ewoc)
                 :to-equal (seq-sort #'string> l))))
+    (it "sorts a flat list using two comparators"
+      (let ((l '([1 "c"] [2 "a"] [3 "b"]
+                 [1 "a"] [2 "b"] [3 "a"]
+                 [1 "b"] [2 "c"] [3 "c"])))
+        (cl-labels ((my-num<    (a b) (<       (aref a 0) (aref b 0)))
+                    (my-string< (a b) (string< (aref a 1) (aref b 1))))
+          (setq ewoc (lister-setup "*LISTER*" (apply-partially #'format "%s")))
+          (lister-set-list ewoc l)
+          (lister-sort-list ewoc (list #'my-num< #'my-string<)))
+        (expect (lister-get-list ewoc)
+                :to-equal
+                '([1 "a"] [1 "b"] [1 "c"]
+                  [2 "a"] [2 "b"] [2 "c"]
+                  [3 "a"] [3 "b"] [3 "c"]))))
     (it "keeps marking state of items:"
       (let ((l '("a" "b" "d" "f" "c")))
         (lister-set-list ewoc l)
@@ -1234,7 +1508,42 @@ low-lewel ewoc functions instead of `lister--parse-position'."
       (lister-mark-unmark-at ewoc 4 t)
       (lister-delete-marked-list ewoc)
       (expect (lister-get-list ewoc)
-              :to-equal '("1" "3" "5" "6" "7" "8" "9" "10")))))
+              :to-equal '("1" "3" "5" "6" "7" "8" "9" "10"))))
+
+  (describe "lister-set-marking-predicate"
+    (it "sets the buffer local predicate"
+      (lister-set-list ewoc l)
+      (lister-set-marking-predicate ewoc #'identity)
+      (expect (with-current-buffer (ewoc-buffer ewoc)
+                lister-local-marking-predicate)
+              :to-equal #'identity))
+    (it "keeps all previous marks if set to nil"
+      (lister-set-list ewoc l)
+      (lister-dolist-nodes (ewoc node)
+        (lister-mark-unmark-at ewoc node t))
+      (lister-set-marking-predicate ewoc nil)
+      (expect (lister-get-marked-list ewoc)
+              :to-equal l))
+    (it "keeps marks which match the new predicate"
+      (lister-set-list ewoc l)
+      (lister-dolist-nodes (ewoc node)
+        (lister-mark-unmark-at ewoc node t))
+      (let ((pred (lambda (data)
+                    (cl-evenp (string-to-number data)))))
+        (lister-set-marking-predicate ewoc pred)
+        (expect (lister-get-marked-list ewoc)
+                :to-equal (seq-filter pred l)))))
+
+  (describe "lister-mark-unmark-at with marking predicate"
+    (it "only allows marking of matching items"
+      (lister-set-list ewoc l)
+      (let ((pred (lambda (data)
+                    (cl-evenp (string-to-number data)))))
+        (lister-set-marking-predicate ewoc pred)
+        (lister-dolist-nodes (ewoc node)
+          (lister-mark-unmark-at ewoc node t))
+        (expect (lister-get-marked-list ewoc)
+                :to-equal (seq-filter pred l))))))
 
 (describe "Interactive Editing"
   :var (ewoc l)
@@ -1244,13 +1553,14 @@ low-lewel ewoc functions instead of `lister--parse-position'."
   (after-each
     (kill-buffer (ewoc-buffer ewoc)))
 
-  (describe "lister--finally-moving-to"
+  (describe "lister-save-current-node"
     (it "leaves point at node when other nodes are changed:"
       (lister-set-list ewoc '("0" "1" "2"))
       (with-current-buffer (ewoc-buffer ewoc)
         (let* ((node (lister-get-node-at ewoc 2))
+               (_    (lister-goto ewoc node))
                (p    (marker-position (lister--item-beg (ewoc-data node)))))
-          (lister--finally-moving-to ewoc node
+          (lister-save-current-node ewoc
             (lister-delete-at ewoc 1)
             (lister-insert-at ewoc 1 "1"))
           (expect (point) :to-equal p))))
@@ -1258,7 +1568,8 @@ low-lewel ewoc functions instead of `lister--parse-position'."
       (lister-set-list ewoc '("0" "1" "2"))
       (with-current-buffer (ewoc-buffer ewoc)
         (let* ((node (lister-get-node-at ewoc 2)))
-          (lister--finally-moving-to ewoc node
+          (lister-goto ewoc node)
+          (lister-save-current-node ewoc
             (lister-insert-list ewoc 2 '("NEU" "NEW" "NEUF")))
           (expect (point) :to-equal (marker-position (lister--item-beg (ewoc-data node)))))))
     (it "leaves point untouched when item is gone:"
@@ -1266,11 +1577,32 @@ low-lewel ewoc functions instead of `lister--parse-position'."
       (lister-goto ewoc :first)
       (with-current-buffer (ewoc-buffer ewoc)
         (let* ((node (lister-get-node-at ewoc 2))
+               (_    (lister-goto ewoc node))
                (p    (point)))
-          (lister--finally-moving-to ewoc node
+          (lister-save-current-node ewoc
             (lister-delete-at ewoc node))
-          (expect (point) :to-be p)))))
-  
+          (expect (point) :to-be p))))
+    (it "keeps point at footer:"
+      (lister-set-list ewoc '("0" "1" "2" "3" "4"))
+      (lister-set-footer ewoc "FOOTER")
+      (with-current-buffer (ewoc-buffer ewoc)
+        (ewoc-goto-node ewoc (ewoc--footer ewoc))
+      (lister-save-current-node ewoc
+          (lister-set-list ewoc '("NEW" "StuFF")))
+      (expect (lister-eolp) :to-be-truthy)
+      (expect (with-current-buffer (ewoc-buffer ewoc)
+                (eobp)) :not :to-be-truthy)))
+    (it "keeps point at eob:"
+      (lister-set-list ewoc '("0" "1" "2" "3" "4"))
+      (lister-set-footer ewoc "FOOTER")
+      (with-current-buffer (ewoc-buffer ewoc)
+        (goto-char (point-max)))
+      (lister-save-current-node ewoc
+          (lister-set-list ewoc '("NEW" "StuFF")))
+      (expect (lister-eolp) :to-be-truthy)
+      (expect (with-current-buffer (ewoc-buffer ewoc)
+                (eobp)) :to-be-truthy)))
+
   (describe "lister--next-node-same-level"
     (it "finds the next node with the same level:"
       (lister-set-list ewoc '("0" ("1") "2"))
@@ -1343,7 +1675,7 @@ low-lewel ewoc functions instead of `lister--parse-position'."
       (lister-set-filter ewoc (apply-partially #'string-match-p "A"))
       (lister--move-item ewoc 4 #'lister--prev-visible-node t nil)
       (expect (lister-get-list ewoc)
-              :to-equal '("0" "1" "4" "A" "2" "5"))))    
+              :to-equal '("0" "1" "4" "A" "2" "5"))))
 
   (describe "lister-move-item-up"
     (it "throws an error if no movement is possible:"
@@ -1458,6 +1790,22 @@ low-lewel ewoc functions instead of `lister--parse-position'."
       (lister-move-sublist-right ewoc 1)
       (expect (lister-get-list ewoc)
               :to-equal '("0" (("A" "B")))))))
+
+;; -----------------------------------------------------------
+;; * Tests for Lister Mode
+;; -----------------------------------------------------------
+
+(describe "Lister mode"
+  (it "disables view mode if `view-read-only' is set"
+    (let* ((view-read-only t)
+           (ewoc (lister-test-setup-minimal-buffer))
+           (buf  (ewoc-buffer ewoc)))
+      (with-current-buffer buf
+        (lister-mode +1)
+        (expect lister-mode :to-be-truthy)
+        (expect view-mode :not :to-be-truthy))
+      (kill-buffer buf))))
+
 
 (provide 'lister-tests)
 ;;; lister-tests.el ends here
